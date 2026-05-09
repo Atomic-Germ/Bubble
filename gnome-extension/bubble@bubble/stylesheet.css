@@ -1,0 +1,114 @@
+/* =========================================================================
+   Bubble — stylesheet.css
+   ========================================================================= */
+
+/* ── Outer window ────────────────────────────────────────────────────────── */
+.bubble-window {
+    background-color: rgba(14, 14, 20, 0.97);
+    border-radius:    16px;
+    border:           1px solid rgba(255, 255, 255, 0.10);
+    box-shadow:       0 24px 64px rgba(0, 0, 0, 0.72);
+}
+
+/* ── Header ──────────────────────────────────────────────────────────────── */
+.bubble-header {
+    padding:       10px 14px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+    spacing:       6px;
+}
+
+.bubble-title {
+    font-size:   13px;
+    font-weight: bold;
+    color:       rgba(255, 255, 255, 0.85);
+}
+
+.bubble-icon-btn {
+    background-color: transparent;
+    border:           none;
+    color:            rgba(255, 255, 255, 0.40);
+    border-radius:    6px;
+    padding:          3px 7px;
+    font-size:        13px;
+}
+
+.bubble-icon-btn:hover {
+    background-color: rgba(255, 255, 255, 0.09);
+    color:            rgba(255, 255, 255, 0.80);
+}
+
+/* ── Scroll area ─────────────────────────────────────────────────────────── */
+.bubble-scroll {
+    padding: 4px 0;
+}
+
+.bubble-msgs {
+    padding: 10px 12px;
+    spacing: 8px;
+}
+
+/* ── Message bubbles ─────────────────────────────────────────────────────── */
+.bubble-msg {
+    font-size:     13px;
+    padding:       10px 14px;
+    border-radius: 14px;
+    max-width:     360px;
+}
+
+.bubble-msg-user {
+    background-color: rgba(99, 102, 241, 0.85);
+    color:            rgba(255, 255, 255, 0.96);
+    border-radius:    14px 14px 4px 14px;
+}
+
+.bubble-msg-assistant {
+    background-color: rgba(40, 40, 52, 0.92);
+    color:            rgba(230, 230, 240, 0.92);
+    border-radius:    14px 14px 14px 4px;
+}
+
+.bubble-error {
+    color: rgba(255, 110, 110, 0.95) !important;
+}
+
+/* ── Input bar ───────────────────────────────────────────────────────────── */
+.bubble-input-row {
+    padding:       10px 12px;
+    border-top:    1px solid rgba(255, 255, 255, 0.07);
+    spacing:       8px;
+}
+
+.bubble-entry {
+    background-color: rgba(255, 255, 255, 0.06);
+    border:           1px solid rgba(255, 255, 255, 0.11);
+    border-radius:    10px;
+    color:            rgba(255, 255, 255, 0.90);
+    padding:          8px 12px;
+    font-size:        13px;
+    caret-color:      rgba(99, 102, 241, 0.9);
+}
+
+.bubble-entry:focus {
+    border-color:     rgba(99, 102, 241, 0.55);
+    background-color: rgba(255, 255, 255, 0.08);
+}
+
+.bubble-send-btn {
+    background-color: rgba(99, 102, 241, 0.90);
+    color:            white;
+    border-radius:    10px;
+    width:            36px;
+    height:           36px;
+    font-size:        16px;
+    border:           none;
+    font-weight:      bold;
+}
+
+.bubble-send-btn:hover {
+    background-color: rgba(99, 102, 241, 1.00);
+}
+
+.bubble-send-btn:insensitive {
+    background-color: rgba(99, 102, 241, 0.35);
+    color:            rgba(255, 255, 255, 0.45);
+}

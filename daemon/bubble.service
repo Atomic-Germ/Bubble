@@ -1,0 +1,18 @@
+[Unit]
+Description=Bubble AI Chat Daemon
+Documentation=file://%h/.local/lib/bubble/README.md
+After=graphical-session.target
+Wants=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/lib/bubble/bubble-daemon.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+# Forward FastFlowLM port override if set system-wide
+# PassEnvironment=FLM_SERVE_PORT BUBBLE_MODEL
+
+[Install]
+WantedBy=graphical-session.target
