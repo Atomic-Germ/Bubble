@@ -316,18 +316,22 @@ export default class BubbleExtension extends Extension {
         if (!text) return;
 
         this._entry.set_text('');
-        this._addMessage('user', text);
         this._setInputEnabled(false);
         this._streaming = true;
 
-        // Generate the UUID here so _currentToken is set synchronously,
-        // before any D-Bus round-trip. This eliminates the race where a
-        // very fast NPU emits StreamDone before call_finish() runs.
+        // Generate UUID synchronously before the D-Bus call so _currentToken
+        // is already set when the first StreamChunk signal arrives.
         const token = GLib.uuid_string_random();
         this._currentToken = token;
 
-        // Pre-create the assistant bubble so chunks stream into it
-        this._streamLabel = this._addMessage('assistant', '');
+        // Add UI bubbles — kept separate from the proxy call so a UI error
+        // can never prevent the message from reaching the daemon.
+        try {
+            this._addMessage('user', text);
+            this._streamLabel = this._addMessage('assistant', '');
+        } catch (e) {
+            console.error(`[Bubble] UI error in _send: ${e}`);
+        }
 
         this._proxy.call(
             'SendMessage',
@@ -340,9 +344,11 @@ export default class BubbleExtension extends Extension {
                     _proxy.call_finish(result);
                 } catch (e) {
                     console.error(`[Bubble] SendMessage error: ${e}`);
-                    this._streamLabel?.add_style_class_name('bubble-error');
-                    this._streamLabel?.set_text(`⚠ ${e.message}`);
-                    this._streamLabel  = null;
+                    if (this._streamLabel) {
+                        this._streamLabel.add_style_class_name('bubble-error');
+                        this._streamLabel.set_text(`⚠ ${e.message}`);
+                        this._streamLabel = null;
+                    }
                     this._streaming    = false;
                     this._currentToken = null;
                     this._setInputEnabled(true);
@@ -382,22 +388,18 @@ export default class BubbleExtension extends Extension {
 
         row.add_child(label);
         this._msgBox.add_child(row);
-        this._scrollToBottom();
         return label;
     }
 
     _scrollToBottom() {
+        // Queue a scroll on the next frame using GLib.idle_add so this
+        // method is always synchronous and can never throw into callers.
         GLib.idle_add(GLib.PRIORITY_LOW, () => {
             try {
-                // vadjustment is a direct property on St.ScrollView (GNOME 47+).
-                // Fall back to the older get_vscroll_bar() API defensively.
-                const adj = this._scrollView?.vadjustment
-                         ?? this._scrollView?.get_vscroll_bar?.()?.get_adjustment?.();
-                if (adj)
-                    adj.value = adj.upper - adj.page_size;
-            } catch (_e) {
-                // Swallow silently — never let a scroll error loop the idle queue.
-            }
+                const last = this._msgBox?.get_last_child();
+                if (last)
+                    this._scrollView?.scroll_to_actor(last);
+            } catch (_e) { /* ignore any version-specific API mismatch */ }
             return GLib.SOURCE_REMOVE;
         });
     }
