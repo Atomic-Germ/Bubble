@@ -13,6 +13,8 @@ import re
 import sys
 import json
 import time
+import math
+import hashlib
 import shutil
 import threading
 import logging
@@ -56,6 +58,9 @@ SUMMARIZE_AT_TURNS   = 40  # trigger when history ≥ this many pairs
 SUMMARIZE_KEEP_TURNS = 20  # always keep this many recent pairs intact
 MAX_MEMORY_ITEMS_IN_PROMPT = 24
 MEMORY_META_KEY = "_memory_meta"
+DEFAULT_EMBED_MODEL = "embed-gemma:300m"
+DEFAULT_EMBED_TIMEOUT = 3.0
+DEFAULT_EMBED_MAX_TEXT_CHARS = 1600
 
 TAG_FIELDS = {"intent", "topic", "sentiment", "user", "user_identity"}
 
@@ -244,6 +249,21 @@ class BubbleDaemon:
         self._dreaming    = False  # prevents concurrent dream runs
         self._napping     = False  # prevents concurrent nap runs
         self._ctx_size    = _get_ctx_size()
+        self._embed_mode = os.environ.get("BUBBLE_EMBEDDINGS_ENABLED", "auto").strip().lower()
+        if self._embed_mode not in {"auto", "on", "off"}:
+            self._embed_mode = "auto"
+        self._embed_model = os.environ.get("BUBBLE_EMBED_MODEL", DEFAULT_EMBED_MODEL).strip() or DEFAULT_EMBED_MODEL
+        self._embed_timeout = self._get_float_env("BUBBLE_EMBED_TIMEOUT", DEFAULT_EMBED_TIMEOUT, 0.25, 30.0)
+        self._embed_max_text_chars = self._get_int_env(
+            "BUBBLE_EMBED_MAX_TEXT_CHARS",
+            DEFAULT_EMBED_MAX_TEXT_CHARS,
+            128,
+            4096,
+        )
+        self._embed_enabled_checked = False
+        self._embed_enabled_runtime = False
+        self._embed_cache: dict[str, list[float]] = {}
+        self._embed_lock = threading.Lock()
         # Monotonic timestamp of the last event that changed _memory (remember,
         # forget, dream, summarize).  Used in telemetry reporting.
         self._last_memory_change_time: float = 0.0
@@ -271,13 +291,35 @@ class BubbleDaemon:
         # Subscribe to system sleep signal so we can dream before suspend.
         self._subscribe_sleep_signal()
         log.info(
-            "Bubble daemon ready  port=%d  model=%s",
+            "Bubble daemon ready  port=%d  model=%s  embeddings=%s(%s)",
             self._port,
             self._model or "(auto-detect)",
+            self._embed_mode,
+            self._embed_model,
         )
         if self._system_prompt:
             log.info("System prompt loaded from environment (%d chars)",
                      len(self._system_prompt))
+
+    @staticmethod
+    def _get_int_env(key: str, default: int, min_value: int, max_value: int) -> int:
+        raw = os.environ.get(key, "").strip()
+        if raw.isdigit():
+            value = int(raw)
+            if min_value <= value <= max_value:
+                return value
+        return default
+
+    @staticmethod
+    def _get_float_env(key: str, default: float, min_value: float, max_value: float) -> float:
+        raw = os.environ.get(key, "").strip()
+        try:
+            value = float(raw)
+            if min_value <= value <= max_value:
+                return value
+        except Exception:
+            pass
+        return default
 
     # ------------------------------------------------------------------
     # D-Bus methods
@@ -945,9 +987,8 @@ class BubbleDaemon:
                 terms.add(token)
         return terms
 
-    @classmethod
     def _select_relevant_memory(
-        cls,
+        self,
         user_mem: dict[str, str],
         meta: dict[str, dict[str, str]],
         message: str,
@@ -957,9 +998,19 @@ class BubbleDaemon:
         if not user_mem:
             return [], 0
 
-        query_terms = cls._relevance_terms(message)
+        query_terms = self._relevance_terms(message)
         if context:
-            query_terms |= cls._relevance_terms(str(context.get("window", "")))
+            query_terms |= self._relevance_terms(str(context.get("window", "")))
+
+        semantic_query = "\n".join(
+            p for p in [
+                (message or "").strip(),
+                str((context or {}).get("window", "")).strip(),
+            ] if p
+        )
+        query_vec = None
+        if semantic_query and self._embeddings_enabled():
+            query_vec = self._embed_text(semantic_query)
 
         items = list(user_mem.items())
         if not query_terms:
@@ -968,10 +1019,13 @@ class BubbleDaemon:
             ranked = []
             for idx, (k, v) in enumerate(items):
                 m = meta.get(k, {})
-                recency = cls._recency_score(m.get("updated_at", ""), now)
-                ranked.append((recency, -idx, k, v))
+                recency = self._recency_score(m.get("updated_at", ""), now)
+                semantic = 0
+                if query_vec is not None:
+                    semantic = self._semantic_memory_bonus(query_vec, k, v)
+                ranked.append((semantic + recency, semantic, -idx, k, v))
             ranked.sort(reverse=True)
-            selected = [(k, v) for _s, _i, k, v in ranked[:limit]]
+            selected = [(k, v) for _s, _sem, _i, k, v in ranked[:limit]]
             return selected, max(0, len(items) - len(selected))
 
         scored: list[tuple[int, int, str, str]] = []
@@ -1006,19 +1060,118 @@ class BubbleDaemon:
                         score += 4
                         break
 
-            score += cls._sentiment_strength_score(sentiment)
-            score += cls._user_identity_score(user_identity)
-            score += cls._recency_score(m.get("updated_at", ""), now)
+            score += self._sentiment_strength_score(sentiment)
+            score += self._user_identity_score(user_identity)
+            score += self._recency_score(m.get("updated_at", ""), now)
+
+            semantic = 0
+            if query_vec is not None:
+                semantic = self._semantic_memory_bonus(query_vec, k, v)
+                score += semantic
 
             # Keep lexical evidence as a tiebreaker to stabilize ranking.
-            scored.append((score, lexical_hits, -idx, k, v))
+            scored.append((score, semantic, lexical_hits, -idx, k, v))
 
         scored.sort(reverse=True)
-        selected = [(k, v) for score, _hits, _neg_idx, k, v in scored if score > 0][:limit]
+        selected = [(k, v) for score, _sem, _hits, _neg_idx, k, v in scored if score > 0][:limit]
         if not selected:
             # If all scores are zero, default to recency ordering.
-            selected = [(k, v) for _s, _h, _i, k, v in scored[:limit]]
+            selected = [(k, v) for _s, _sem, _h, _i, k, v in scored[:limit]]
         return selected, max(0, len(items) - len(selected))
+
+    def _semantic_memory_bonus(self, query_vec: list[float], key: str, value: str) -> int:
+        text = f"{key}\n{value}".strip()
+        if not text:
+            return 0
+        vec = self._embed_text(text)
+        if not vec:
+            return 0
+        sim = self._cosine_similarity(query_vec, vec)
+        if sim <= 0:
+            return 0
+        # Scale similarity into a bounded additive score so lexical/tag logic
+        # remains primary while semantic closeness can break ties.
+        return int(round(sim * 6))
+
+    def _embeddings_enabled(self) -> bool:
+        if self._embed_mode == "off":
+            return False
+        if self._embed_enabled_checked:
+            return self._embed_enabled_runtime
+
+        self._embed_enabled_checked = True
+        probe = self._embed_text_raw("bubble embeddings probe")
+        self._embed_enabled_runtime = probe is not None
+
+        if self._embed_enabled_runtime:
+            log.info("Embeddings enabled with model %s", self._embed_model)
+        else:
+            level = logging.WARNING if self._embed_mode == "on" else logging.INFO
+            log.log(level, "Embeddings unavailable; continuing without semantic recall")
+
+        return self._embed_enabled_runtime
+
+    def _embed_text(self, text: str) -> list[float] | None:
+        clean = (text or "").strip()
+        if not clean:
+            return None
+        if len(clean) > self._embed_max_text_chars:
+            clean = clean[: self._embed_max_text_chars]
+
+        cache_key = f"{self._embed_model}:{hashlib.sha1(clean.encode('utf-8', 'ignore')).hexdigest()}"
+        with self._embed_lock:
+            cached = self._embed_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        vec = self._embed_text_raw(clean)
+        if vec is None:
+            return None
+
+        with self._embed_lock:
+            self._embed_cache[cache_key] = vec
+        return vec
+
+    def _embed_text_raw(self, text: str) -> list[float] | None:
+        url = f"http://127.0.0.1:{self._port}/v1/embeddings"
+        payload = {
+            "model": self._embed_model,
+            "input": text,
+        }
+        try:
+            r = requests.post(url, json=payload, timeout=self._embed_timeout)
+            if not r.ok and self._embed_model == "embed-gemma:300m":
+                payload["model"] = "embed-gemma"
+                r = requests.post(url, json=payload, timeout=self._embed_timeout)
+            r.raise_for_status()
+            data = r.json()
+            arr = data.get("data") or []
+            if not arr:
+                return None
+            emb = arr[0].get("embedding")
+            if isinstance(emb, list) and emb:
+                return [float(v) for v in emb]
+        except Exception as exc:
+            log.debug("Embedding request failed: %s", exc)
+        return None
+
+    @staticmethod
+    def _cosine_similarity(a: list[float], b: list[float]) -> float:
+        n = min(len(a), len(b))
+        if n == 0:
+            return 0.0
+        dot = 0.0
+        na = 0.0
+        nb = 0.0
+        for i in range(n):
+            ai = a[i]
+            bi = b[i]
+            dot += ai * bi
+            na += ai * ai
+            nb += bi * bi
+        if na <= 0.0 or nb <= 0.0:
+            return 0.0
+        return dot / (math.sqrt(na) * math.sqrt(nb))
 
     @staticmethod
     def _recency_score(updated_at: str, now: int) -> int:
