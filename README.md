@@ -77,6 +77,32 @@ systemctl --user edit bubble
 systemctl --user restart bubble
 ```
 
+**Optional semantic recall with embeddings:**
+
+Bubble can augment prompts with semantically similar prior turns when an
+OpenAI-compatible `/v1/embeddings` endpoint is available.
+
+FastFlowLM example (runs embedding model alongside the LLM):
+```bash
+flm serve gemma3:4b --embed 1
+```
+
+Enable/disable behavior in Bubble service overrides:
+```bash
+systemctl --user edit bubble
+# Add (example):
+# [Service]
+# Environment=BUBBLE_EMBEDDINGS_ENABLED=auto
+# Environment=BUBBLE_EMBED_MODEL=embed-gemma:300m
+# Environment=BUBBLE_EMBED_MAX_RECALL=4
+systemctl --user restart bubble
+```
+
+Modes:
+- `off`: never call embeddings endpoint
+- `auto`: use embeddings only when endpoint is reachable
+- `on`: require embeddings (logs warning + falls back gracefully if unavailable)
+
 **Override the FastFlowLM port:**
 ```bash
 # In ~/.config/systemd/user/bubble.service.d/override.conf
