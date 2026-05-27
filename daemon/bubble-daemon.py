@@ -18,6 +18,7 @@ import hashlib
 import shutil
 import threading
 import logging
+from collections import deque
 from pathlib import Path
 
 import requests
@@ -249,6 +250,8 @@ class BubbleDaemon:
         self._dreaming    = False  # prevents concurrent dream runs
         self._napping     = False  # prevents concurrent nap runs
         self._ctx_size    = _get_ctx_size()
+        self._daemon_start_mono = time.monotonic()
+        self._daemon_start_wall = time.time()
         self._embed_mode = os.environ.get("BUBBLE_EMBEDDINGS_ENABLED", "auto").strip().lower()
         if self._embed_mode not in {"auto", "on", "off"}:
             self._embed_mode = "auto"
@@ -273,9 +276,26 @@ class BubbleDaemon:
         self._nudge_idle_minutes = 30
         self._nudge_cooldown_min = 60   # minimum gap between any two nudges
         self._last_user_time     = time.monotonic()
+        self._last_assistant_time = 0.0
         self._last_nudge_time    = 0.0  # epoch 0 = never
         self._nudging            = False
         self._nudge_start_time   = 0.0  # monotonic when _nudging was set True
+        self._idle_phase_start_time = self._last_user_time
+        self._time_poll_seconds = self._get_int_env(
+            "BUBBLE_TIME_POLL_SECONDS",
+            15,
+            5,
+            300,
+        )
+        self._time_samples = 0
+        self._last_time_sample = 0.0
+        self._last_time_sample_wall = time.time()
+        self._felt_elapsed_wall = 0.0
+        self._suspend_gap_events = 0
+        self._last_suspend_gap = 0.0
+        self._exchange_events = deque(maxlen=512)
+        self._npu_temp_cached = "N/A"
+        self._npu_load_cached = "N/A"
 
         # Slow-wave state (nightly, runs at most once per local calendar day).
         self._slow_wave_ran_today: bool = False
@@ -291,11 +311,12 @@ class BubbleDaemon:
         # Subscribe to system sleep signal so we can dream before suspend.
         self._subscribe_sleep_signal()
         log.info(
-            "Bubble daemon ready  port=%d  model=%s  embeddings=%s(%s)",
+            "Bubble daemon ready  port=%d  model=%s  embeddings=%s(%s)  time_poll=%ss",
             self._port,
             self._model or "(auto-detect)",
             self._embed_mode,
             self._embed_model,
+            self._time_poll_seconds,
         )
         if self._system_prompt:
             log.info("System prompt loaded from environment (%d chars)",
@@ -320,6 +341,66 @@ class BubbleDaemon:
         except Exception:
             pass
         return default
+
+    @staticmethod
+    def _format_elapsed(seconds: float) -> str:
+        secs = max(0, int(seconds))
+        if secs < 60:
+            return f"{secs}s"
+        if secs < 3600:
+            return f"{secs // 60}m {secs % 60}s"
+        if secs < 86400:
+            h = secs // 3600
+            m = (secs % 3600) // 60
+            return f"{h}h {m}m"
+        d = secs // 86400
+        h = (secs % 86400) // 3600
+        return f"{d}d {h}h"
+
+    def _sample_temporal_state(self) -> None:
+        """Periodic low-cost sampler for time passage and hardware state."""
+        temp, load = self._read_hwmon_npu()
+        now_mono = time.monotonic()
+        now_wall = time.time()
+        with self._lock:
+            wall_delta = max(0.0, now_wall - self._last_time_sample_wall)
+            mono_delta = max(0.0, now_mono - self._last_time_sample)
+            # Clamp pathological jumps but still preserve suspend/resume drift.
+            self._felt_elapsed_wall += min(wall_delta, 3600.0)
+            drift = wall_delta - mono_delta
+            if self._last_time_sample > 0.0 and drift >= 30.0:
+                self._suspend_gap_events += 1
+                self._last_suspend_gap = drift
+            self._last_time_sample_wall = now_wall
+            self._last_time_sample = now_mono
+            self._time_samples += 1
+            self._npu_temp_cached = temp
+            self._npu_load_cached = load
+
+    @staticmethod
+    def _day_phase(hour: int) -> str:
+        if 5 <= hour < 9:
+            return "early morning"
+        if 9 <= hour < 12:
+            return "morning"
+        if 12 <= hour < 17:
+            return "afternoon"
+        if 17 <= hour < 21:
+            return "evening"
+        return "night"
+
+    @staticmethod
+    def _tempo_label(avg_gap_secs: float) -> str:
+        if avg_gap_secs < 90:
+            return "rapid"
+        if avg_gap_secs < 300:
+            return "steady"
+        if avg_gap_secs < 1200:
+            return "reflective"
+        return "sporadic"
+
+    def _record_exchange_event_unlocked(self, when_mono: float | None = None) -> None:
+        self._exchange_events.append(when_mono if when_mono is not None else time.monotonic())
 
     # ------------------------------------------------------------------
     # D-Bus methods
@@ -942,7 +1023,9 @@ class BubbleDaemon:
     def SendMessage(self, message: str, token: str, context_json: str) -> None:
         """Queue a user message for streaming; token is provided by the caller."""
         with self._lock:
-            self._last_user_time = time.monotonic()
+            now = time.monotonic()
+            self._last_user_time = now
+            self._idle_phase_start_time = now
         try:
             context = json.loads(context_json) if context_json else {}
         except json.JSONDecodeError:
@@ -1287,6 +1370,29 @@ class BubbleDaemon:
                     f"Working notes: {t['scratch_nodes']}. "
                     f"Last memory change: {t['last_prune']}."
                 )
+                lines.append(
+                    f"Temporal state: daemon awake {t['uptime']}; "
+                    f"user quiet {t['since_user']}; "
+                    f"current idle phase {t['idle_phase']}; "
+                    f"last assistant output {t['since_assistant']}."
+                )
+                lines.append(
+                    f"Heartbeat sensing: every ~{t['time_poll_seconds']}s; "
+                    f"{t['time_samples']} samples; "
+                    f"last sample {t['last_sample_age']} ago; "
+                    f"felt wall-time {t['felt_elapsed_wall']}."
+                )
+                lines.append(
+                    f"Rhythm: local {t['weekday']} {t['day_phase']}; "
+                    f"exchange tempo {t['exchange_tempo']}; "
+                    f"density {t['events_10m']} in 10m, {t['events_60m']} in 1h."
+                )
+                lines.append(
+                    f"Continuity: quiet-heartbeats ~{t['quiet_heartbeats']}; "
+                    f"suspend gaps observed {t['suspend_events']}"
+                    + (f" (last {t['last_suspend_gap']})" if t['suspend_events'] > 0 else "")
+                    + "."
+                )
             parts.append("\n".join(lines))
 
         parts.append(
@@ -1468,6 +1574,9 @@ class BubbleDaemon:
             clean_text, sleep_intent = self._extract_sleep_intent(clean_text)
             self._history.append({"role": "assistant", "content": clean_text})
             self._trim_history()
+            now = time.monotonic()
+            self._last_assistant_time = now
+            self._record_exchange_event_unlocked(now)
 
         self._set_status("chatting", "streaming response")
 
@@ -1769,10 +1878,25 @@ class BubbleDaemon:
         token_est  = self._estimate_tokens()
         ctx_pct    = int(100 * token_est / self._ctx_size) if self._ctx_size else 0
 
+        now_mono = time.monotonic()
+        now_local = time.localtime()
         with self._lock:
             mem_nodes    = sum(1 for k in self._memory if not k.startswith("_"))
             scratch_nodes = len(self._scratch)
             last_change  = self._last_memory_change_time
+            last_user = self._last_user_time
+            last_assistant = self._last_assistant_time
+            idle_phase_start = self._idle_phase_start_time
+            daemon_start = self._daemon_start_mono
+            felt_elapsed_wall = self._felt_elapsed_wall
+            time_samples = self._time_samples
+            last_sample = self._last_time_sample
+            time_poll_seconds = self._time_poll_seconds
+            suspend_events = self._suspend_gap_events
+            last_suspend_gap = self._last_suspend_gap
+            exchange_events = list(self._exchange_events)
+            npu_temp = self._npu_temp_cached
+            npu_load = self._npu_load_cached
 
         # Human-readable "last pruning" age.
         if last_change == 0.0:
@@ -1786,7 +1910,32 @@ class BubbleDaemon:
             else:
                 last_prune_str = f"{secs/3600:.1f}h ago"
 
-        npu_temp, npu_load = self._read_hwmon_npu()
+        # Use background-sampled hardware values when available, with a safe
+        # one-shot fallback before the first sample arrives.
+        if npu_temp == "N/A" and npu_load == "N/A":
+            npu_temp, npu_load = self._read_hwmon_npu()
+
+        since_user_secs = max(0.0, now_mono - last_user)
+        since_assistant_secs = max(0.0, now_mono - last_assistant) if last_assistant > 0 else -1.0
+        idle_phase_secs = max(0.0, now_mono - idle_phase_start)
+        uptime_secs = max(0.0, now_mono - daemon_start)
+        last_sample_age_secs = max(0.0, now_mono - last_sample) if last_sample > 0 else -1.0
+        quiet_heartbeats = int(since_user_secs // max(1, time_poll_seconds))
+
+        events_10m = sum(1 for ts in exchange_events if now_mono - ts <= 600)
+        events_60m = sum(1 for ts in exchange_events if now_mono - ts <= 3600)
+        events_6h = sum(1 for ts in exchange_events if now_mono - ts <= 21600)
+
+        exchange_tempo = "insufficient data"
+        if len(exchange_events) >= 2:
+            recent = exchange_events[-8:]
+            gaps = [recent[i] - recent[i - 1] for i in range(1, len(recent))]
+            if gaps:
+                avg_gap = sum(gaps) / len(gaps)
+                exchange_tempo = f"{self._tempo_label(avg_gap)} (~{self._format_elapsed(avg_gap)} avg gap)"
+
+        weekday = time.strftime("%A", now_local)
+        day_phase = self._day_phase(now_local.tm_hour)
 
         return {
             "token_est":      token_est,
@@ -1797,6 +1946,31 @@ class BubbleDaemon:
             "last_prune":     last_prune_str,
             "npu_temp":       npu_temp,
             "npu_load":       npu_load,
+            "uptime":         self._format_elapsed(uptime_secs),
+            "since_user":     self._format_elapsed(since_user_secs),
+            "since_assistant": (
+                self._format_elapsed(since_assistant_secs)
+                if since_assistant_secs >= 0
+                else "never in this daemon session"
+            ),
+            "idle_phase":     self._format_elapsed(idle_phase_secs),
+            "felt_elapsed_wall": self._format_elapsed(felt_elapsed_wall),
+            "time_samples":   time_samples,
+            "last_sample_age": (
+                self._format_elapsed(last_sample_age_secs)
+                if last_sample_age_secs >= 0
+                else "not sampled yet"
+            ),
+            "time_poll_seconds": time_poll_seconds,
+            "quiet_heartbeats": quiet_heartbeats,
+            "events_10m": events_10m,
+            "events_60m": events_60m,
+            "events_6h": events_6h,
+            "exchange_tempo": exchange_tempo,
+            "weekday": weekday,
+            "day_phase": day_phase,
+            "suspend_events": suspend_events,
+            "last_suspend_gap": self._format_elapsed(last_suspend_gap),
         }
 
     # ------------------------------------------------------------------
@@ -1805,8 +1979,9 @@ class BubbleDaemon:
     def _watcher_thread(self) -> None:
         log.info("Nudge watcher started")
         while True:
-            time.sleep(60)
+            time.sleep(self._time_poll_seconds)
             try:
+                self._sample_temporal_state()
                 self._consider_nudge()
                 self._consider_slow_wave()
             except Exception as exc:
@@ -2004,6 +2179,9 @@ class BubbleDaemon:
                 # Commit to history only when the model actually said something.
                 self._history.append({"role": "assistant", "content": clean_text})
                 self._trim_history()
+                now = time.monotonic()
+                self._last_assistant_time = now
+                self._record_exchange_event_unlocked(now)
             self._nudging         = False
             self._last_nudge_time = time.monotonic()
 
