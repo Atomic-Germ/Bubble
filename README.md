@@ -20,7 +20,7 @@ The conversation context is maintained continuously until cleared.
 ┌────────────────────▼───────────────────────┐
 │  Bubble Daemon  (systemd user service)     │
 │  • Holds conversation history              │
-│  • Streams from FastFlowLM  /v1/chat/…    │
+│  • Streams from FastFlowLM  /v1/chat/…     │
 │  • Emits StreamChunk / StreamDone signals  │
 └────────────────────┬───────────────────────┘
                      │ HTTP SSE (port 52625)
