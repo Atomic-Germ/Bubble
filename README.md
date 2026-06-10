@@ -1,6 +1,6 @@
 # Bubble
 
-A minimal resident AI chat assistant for GNOME, powered by [FastFlowLM](https://fastflowlm.com/).
+A resident AI chat assistant for GNOME, powered by [FastFlowLM](https://fastflowlm.com/).
 
 Press **Super+B** anywhere on your desktop to open a floating chat bubble.  
 The conversation context is maintained continuously until cleared.
