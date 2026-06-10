@@ -23,6 +23,60 @@
     color:       rgba(255, 255, 255, 0.85);
 }
 
+.bubble-status {
+    spacing:       4px;
+    padding:       4px 9px;
+    border-radius: 999px;
+    background-color: rgba(255, 255, 255, 0.05);
+    margin-right:  4px;
+}
+
+.bubble-status-dot {
+    font-size: 11px;
+    margin-top: 1px;
+}
+
+.bubble-status-label {
+    font-size:   11px;
+    font-weight: bold;
+}
+
+.bubble-status-hanging-out,
+.bubble-status-idle {
+    color: rgba(165, 173, 199, 0.90);
+}
+
+.bubble-status-chatting {
+    color: rgba(114, 225, 191, 0.95);
+}
+
+.bubble-status-napping {
+    color: rgba(243, 191, 99, 0.95);
+}
+
+.bubble-status-sleeping {
+    color: rgba(132, 154, 255, 0.96);
+}
+
+.bubble-proposal {
+    spacing:       4px;
+    padding:       4px 9px;
+    border-radius: 999px;
+    background-color: rgba(245, 179, 74, 0.12);
+    border: 1px solid rgba(245, 179, 74, 0.25);
+    margin-right:  2px;
+}
+
+.bubble-proposal-label {
+    font-size:   11px;
+    font-weight: bold;
+    color: rgba(245, 199, 120, 0.95);
+}
+
+.bubble-proposal-btn {
+    padding: 3px 6px;
+}
+
 .bubble-icon-btn {
     background-color: transparent;
     border:           none;
@@ -64,7 +118,7 @@
 .bubble-msg-assistant {
     background-color: rgba(40, 40, 52, 0.92);
     color:            rgba(230, 230, 240, 0.92);
-    border-radius:    14px 14px 14px 4px;
+    border-radius:    6px 6px 6px 4px;
 }
 
 .bubble-error {
@@ -112,3 +166,30 @@
     background-color: rgba(99, 102, 241, 0.35);
     color:            rgba(255, 255, 255, 0.45);
 }
+
+/* ── Thinking section ────────────────────────────────────────────────────── */
+.bubble-think-toggle {
+    background-color: transparent;
+    border:           none;
+    color:            rgba(160, 160, 185, 0.45);
+    font-size:        11px;
+    padding:          0 0 3px 0;
+    text-align:       left;
+}
+
+.bubble-think-toggle:hover {
+    color: rgba(160, 160, 185, 0.80);
+}
+
+.bubble-think {
+    color:            rgba(160, 160, 185, 0.55);
+    font-size:        11px;
+    background-color: rgba(255, 255, 255, 0.03);
+    border-radius:    6px;
+    padding:          5px 8px;
+    margin-bottom:    6px;
+}
+
+/* ── Inline / block code (Pango <tt> inside assistant label) ─────────────── */
+/* St.Label does not expose tt{} as a CSS selector; colour is set inline      */
+/* via the Pango span foreground="#8fbcbb". This comment is a breadcrumb.     */

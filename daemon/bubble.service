@@ -11,8 +11,10 @@ Restart=on-failure
 RestartSec=5
 StandardOutput=journal
 StandardError=journal
-# Forward FastFlowLM port override if set system-wide
+# Forward overrides if set system-wide
 # PassEnvironment=FLM_SERVE_PORT BUBBLE_MODEL
+# Optional semantic recall via /v1/embeddings (off|auto|on)
+# PassEnvironment=BUBBLE_EMBEDDINGS_ENABLED BUBBLE_EMBED_MODEL BUBBLE_EMBED_MAX_RECALL BUBBLE_EMBED_TIMEOUT
 
 [Install]
 WantedBy=graphical-session.target

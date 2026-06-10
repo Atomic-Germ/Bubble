@@ -87,4 +87,5 @@ echo "  Keyboard shortcut: Super+B  (change via gnome-extensions prefs or gsetti
 echo ""
 echo "  Service status:    systemctl --user status bubble"
 echo "  Service logs:      journalctl --user -u bubble -f"
+echo "  Optional embed:    systemctl --user edit bubble  (set BUBBLE_EMBEDDINGS_ENABLED/BUBBLE_EMBED_MODEL)"
 echo ""
