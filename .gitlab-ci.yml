@@ -1,0 +1,8 @@
+stages:
+  - test
+
+job_test:
+  stage: test
+  script:
+    - echo "Running tests"
+    - pytest tests/
