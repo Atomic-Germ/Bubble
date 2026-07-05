@@ -608,6 +608,34 @@ class BubbleDaemon:
         else:
             self._memory.pop(MEMORY_META_KEY, None)
 
+    def _upsert_memory_meta_unlocked(
+        self,
+        key: str,
+        source: str | None = None,
+        tags: dict[str, str] | None = None,
+    ) -> None:
+        meta = self._memory_meta_unlocked()
+        node = dict(meta.get(key, {}))
+        if source:
+            node["source"] = source
+        node["updated_at"] = str(int(time.time()))
+
+        if tags:
+            for tag_key in ("intent", "topic", "sentiment"):
+                if tag_key in tags:
+                    node[tag_key] = tags[tag_key]
+            user_identity = tags.get("user_identity") or tags.get("user")
+            if user_identity:
+                node["user_identity"] = user_identity
+
+        meta[key] = node
+        self._set_memory_meta_unlocked(meta)
+
+    def _drop_memory_meta_unlocked(self, key: str) -> None:
+        meta = self._memory_meta_unlocked()
+        if meta.pop(key, None) is not None:
+            self._set_memory_meta_unlocked(meta)
+
     @staticmethod
     def _parse_value_tags(raw_value: str) -> tuple[str, dict[str, str]]:
         """Parse optional inline tags from remember values.
@@ -749,7 +777,11 @@ class BubbleDaemon:
         """
         changed = False
 
-        def apply_remember(source: str | None, arg: str) -> str | None:
+        def apply_remember(
+            source: str | None,
+            arg: str,
+            tags: dict[str, str] | None = None,
+        ) -> str | None:
             nonlocal changed
             arg = arg.strip()
             if self._is_placeholder(arg):
@@ -778,13 +810,7 @@ class BubbleDaemon:
 
             if key and not key.startswith('_'):
                 self._memory[key] = value
-                meta = self._memory_meta_unlocked()
-                node = dict(meta.get(key, {}))
-                if source:
-                    node["source"] = source
-                node["updated_at"] = str(int(time.time()))
-                meta[key] = node
-                self._set_memory_meta_unlocked(meta)
+                self._upsert_memory_meta_unlocked(key, source=source, tags=tags)
                 changed = True
                 log.info("Memory remember (%s): %r = %r", source or "untagged", key, value)
                 return key
@@ -801,20 +827,7 @@ class BubbleDaemon:
                 raw_key, raw_value = arg.split('=', 1)
                 parsed_value, tags = self._parse_value_tags(raw_value.strip())
                 arg_for_apply = f"{raw_key.strip()}={parsed_value}"
-            # apply_remember handles source-tagging and metadata timestamp
-            # update.  We overlay parsed tags after key resolution.
-            resolved_key = apply_remember(source, arg_for_apply)
-            if resolved_key and tags and not resolved_key.startswith('_'):
-                meta = self._memory_meta_unlocked()
-                node = dict(meta.get(resolved_key, {}))
-                for tag_key in ("intent", "topic", "sentiment"):
-                    if tag_key in tags:
-                        node[tag_key] = tags[tag_key]
-                user_identity = tags.get("user_identity") or tags.get("user")
-                if user_identity:
-                    node["user_identity"] = user_identity
-                meta[resolved_key] = node
-                self._set_memory_meta_unlocked(meta)
+            apply_remember(source, arg_for_apply, tags)
             return ""
 
         def on_remember_alias(m: re.Match) -> str:
@@ -835,9 +848,7 @@ class BubbleDaemon:
                 log.info("Memory forget ignored for internal key: %r", key)
                 return ""
             if self._memory.pop(key, None) is not None:
-                meta = self._memory_meta_unlocked()
-                if meta.pop(key, None) is not None:
-                    self._set_memory_meta_unlocked(meta)
+                self._drop_memory_meta_unlocked(key)
                 changed = True
                 log.info("Memory forget (model): %r", key)
             return ""

@@ -192,104 +192,7 @@ export default class BubbleExtension extends Extension {
                 this._proxySigs.push(
                     this._proxy.connect('g-signal', (_proxy, _sender, signalName, params) => {
                         const unpacked = params.deepUnpack();
-                        const token    = unpacked[0];
-
-                        if (signalName === 'StreamChunk') {
-                            const text = unpacked[1];
-                            if (token !== this._currentToken) return;
-                            this._bumpStreamWatchdog(token);
-                            const cur = this._streamLabel?.get_text() ?? '';
-                            this._streamLabel?.set_text(cur + text);
-                            this._scrollToBottom();
-
-                        } else if (signalName === 'StreamThink') {
-                            const text = unpacked[1];
-                            if (token !== this._currentToken) return;
-                            this._bumpStreamWatchdog(token);
-                            // Reveal the think section on the first token.
-                            if (this._thinkLabel && !this._thinkLabel.visible) {
-                                this._thinkLabel.show();
-                                this._thinkToggle?.show();
-                            }
-                            const cur = this._thinkLabel?.get_text() ?? '';
-                            this._thinkLabel?.set_text(cur + text);
-                            this._scrollToBottom();
-
-                        } else if (signalName === 'StreamDone') {
-                            if (token !== this._currentToken) return;
-                            this._clearStreamWatchdog();
-                            // Format the completed answer with markdown → Pango
-                            // while we still hold a reference to the label.
-                            if (this._streamLabel) {
-                                const finalText = this._streamLabel.get_text().trim();
-                                if (!finalText) {
-                                    // Command-only replies can resolve to empty text.
-                                    // Remove the placeholder assistant bubble entirely.
-                                    const col = this._streamLabel.get_parent();
-                                    const row = col?.get_parent();
-                                    row?.destroy();
-                                } else {
-                                    const markup = this._markdownToPango(finalText);
-                                    try {
-                                        this._streamLabel.clutter_text.set_markup(markup);
-                                    } catch (_e) {
-                                        // Invalid markup — plain text already displayed.
-                                    }
-                                }
-                            }
-                            this._streaming    = false;
-                            this._currentToken = null;
-                            this._streamLabel  = null;
-                            this._thinkLabel   = null;
-                            this._thinkToggle  = null;
-                            this._setInputEnabled(true);
-
-                        } else if (signalName === 'NudgeStart') {
-                            // Daemon is about to stream an unprompted message.
-                            // Show the bubble and create an empty assistant slot.
-                            if (this._streaming) return; // already busy
-                            this._streaming    = true;
-                            this._currentToken = token;
-                            this._showBubble();
-                            try {
-                                this._streamLabel = this._addMessage('assistant', '');
-                            } catch (e) {
-                                console.error(`[Bubble] NudgeStart UI error: ${e}`);
-                            }
-                            this._setInputEnabled(false);
-                            this._startStreamWatchdog(token);
-
-                        } else if (signalName === 'StatusChanged') {
-                            const state = unpacked[0];
-                            const detail = unpacked[1] ?? '';
-                            this._setStatus(state, detail);
-
-                        } else if (signalName === 'SelfPromptProposalChanged') {
-                            const hasPending = unpacked[0];
-                            const approved = unpacked[1];
-                            this._setProposalState(hasPending, approved);
-
-                        } else if (signalName === 'StreamEdit') {
-                            const cleanText = unpacked[1];
-                            if (token !== this._currentToken) return;
-                            this._streamLabel?.set_text(cleanText);
-
-                        } else if (signalName === 'StreamError') {
-                            const errMsg = unpacked[1];
-                            if (token !== this._currentToken) return;
-                            this._clearStreamWatchdog();
-                            this._streaming    = false;
-                            this._currentToken = null;
-                            if (this._streamLabel) {
-                                this._streamLabel.add_style_class_name('bubble-error');
-                                this._streamLabel.set_text(`⚠ ${errMsg}`);
-                                this._streamLabel = null;
-                            }
-                            this._thinkLabel   = null;
-                            this._thinkToggle  = null;
-                            this._setInputEnabled(true);
-                            this._setStatus('hanging-out', 'idle');
-                        }
+                        this._handleDaemonSignal(signalName, unpacked);
                     }),
                 );
 
@@ -418,20 +321,138 @@ export default class BubbleExtension extends Extension {
         );
     }
 
-    _recoverFromDaemonUnavailable(token, msg) {
-        console.warn(`[Bubble] Daemon unavailable for ${token}; reconnecting (${msg})`);
-        if (this._streamLabel) {
-            this._streamLabel.add_style_class_name('bubble-error');
-            this._streamLabel.set_text('⚠ Daemon unavailable. Reconnecting…');
-            this._streamLabel = null;
-        }
-        this._clearStreamWatchdog();
+    _isActiveStreamToken(token) {
+        return Boolean(token) && token === this._currentToken;
+    }
+
+    _resetStreamingState() {
         this._streaming = false;
         this._currentToken = null;
+        this._streamLabel = null;
         this._thinkLabel = null;
         this._thinkToggle = null;
+    }
+
+    _finishStreamWithError(displayText, statusDetail = 'idle') {
+        this._clearStreamWatchdog();
+        if (this._streamLabel) {
+            this._streamLabel.add_style_class_name('bubble-error');
+            this._streamLabel.set_text(displayText);
+        }
+        this._resetStreamingState();
         this._setInputEnabled(true);
-        this._setStatus('hanging-out', 'daemon reconnecting');
+        this._setStatus('hanging-out', statusDetail);
+    }
+
+    _handleStreamDone(token) {
+        if (!this._isActiveStreamToken(token))
+            return;
+
+        this._clearStreamWatchdog();
+        // Format the completed answer with markdown → Pango
+        // while we still hold a reference to the label.
+        if (this._streamLabel) {
+            const finalText = this._streamLabel.get_text().trim();
+            if (!finalText) {
+                // Command-only replies can resolve to empty text.
+                // Remove the placeholder assistant bubble entirely.
+                const col = this._streamLabel.get_parent();
+                const row = col?.get_parent();
+                row?.destroy();
+            } else {
+                const markup = this._markdownToPango(finalText);
+                try {
+                    this._streamLabel.clutter_text.set_markup(markup);
+                } catch (_e) {
+                    // Invalid markup — plain text already displayed.
+                }
+            }
+        }
+        this._resetStreamingState();
+        this._setInputEnabled(true);
+    }
+
+    _handleDaemonSignal(signalName, unpacked) {
+        const token = unpacked[0];
+
+        if (signalName === 'StreamChunk') {
+            const text = unpacked[1];
+            if (!this._isActiveStreamToken(token)) return;
+            this._bumpStreamWatchdog(token);
+            const cur = this._streamLabel?.get_text() ?? '';
+            this._streamLabel?.set_text(cur + text);
+            this._scrollToBottom();
+            return;
+        }
+
+        if (signalName === 'StreamThink') {
+            const text = unpacked[1];
+            if (!this._isActiveStreamToken(token)) return;
+            this._bumpStreamWatchdog(token);
+            // Reveal the think section on the first token.
+            if (this._thinkLabel && !this._thinkLabel.visible) {
+                this._thinkLabel.show();
+                this._thinkToggle?.show();
+            }
+            const cur = this._thinkLabel?.get_text() ?? '';
+            this._thinkLabel?.set_text(cur + text);
+            this._scrollToBottom();
+            return;
+        }
+
+        if (signalName === 'StreamDone') {
+            this._handleStreamDone(token);
+            return;
+        }
+
+        if (signalName === 'NudgeStart') {
+            // Daemon is about to stream an unprompted message.
+            // Show the bubble and create an empty assistant slot.
+            if (this._streaming) return; // already busy
+            this._streaming = true;
+            this._currentToken = token;
+            this._showBubble();
+            try {
+                this._streamLabel = this._addMessage('assistant', '');
+            } catch (e) {
+                console.error(`[Bubble] NudgeStart UI error: ${e}`);
+            }
+            this._setInputEnabled(false);
+            this._startStreamWatchdog(token);
+            return;
+        }
+
+        if (signalName === 'StatusChanged') {
+            const state = unpacked[0];
+            const detail = unpacked[1] ?? '';
+            this._setStatus(state, detail);
+            return;
+        }
+
+        if (signalName === 'SelfPromptProposalChanged') {
+            const hasPending = unpacked[0];
+            const approved = unpacked[1];
+            this._setProposalState(hasPending, approved);
+            return;
+        }
+
+        if (signalName === 'StreamEdit') {
+            const cleanText = unpacked[1];
+            if (!this._isActiveStreamToken(token)) return;
+            this._streamLabel?.set_text(cleanText);
+            return;
+        }
+
+        if (signalName === 'StreamError') {
+            const errMsg = unpacked[1];
+            if (!this._isActiveStreamToken(token)) return;
+            this._finishStreamWithError(`⚠ ${errMsg}`);
+        }
+    }
+
+    _recoverFromDaemonUnavailable(token, msg) {
+        console.warn(`[Bubble] Daemon unavailable for ${token}; reconnecting (${msg})`);
+        this._finishStreamWithError('⚠ Daemon unavailable. Reconnecting…', 'daemon reconnecting');
 
         this._attemptStartDaemon();
 
@@ -816,17 +837,7 @@ export default class BubbleExtension extends Extension {
                     return GLib.SOURCE_REMOVE;
 
                 console.warn(`[Bubble] Stream watchdog timeout for token ${token}`);
-                if (this._streamLabel) {
-                    this._streamLabel.add_style_class_name('bubble-error');
-                    this._streamLabel.set_text('⚠ Response stalled. You can send another message.');
-                }
-                this._streaming = false;
-                this._currentToken = null;
-                this._streamLabel = null;
-                this._thinkLabel = null;
-                this._thinkToggle = null;
-                this._setInputEnabled(true);
-                this._setStatus('hanging-out', 'idle');
+                this._finishStreamWithError('⚠ Response stalled. You can send another message.');
                 this._streamWatchdogId = 0;
                 return GLib.SOURCE_REMOVE;
             },
