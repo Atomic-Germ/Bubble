@@ -1598,8 +1598,10 @@ class BubbleDaemon:
         self._check_summarize()
         # Check context pressure; dream if we're approaching the limit.
         self._check_dream(reason="context-pressure")
-        self._set_status("hanging-out", "idle")
         # Model may explicitly request a rest cycle.
+        if sleep_intent is not None:
+            self._handle_model_sleep_intent(sleep_intent)
+        self._set_status("hanging-out", "idle")
 
     def _drain_inline_think_content(
         self,
@@ -1654,8 +1656,6 @@ class BubbleDaemon:
             buffer,
             in_inline_think,
         )
-        if sleep_intent is not None:
-            self._handle_model_sleep_intent(sleep_intent)
 
     def _handle_model_sleep_intent(self, mode: str) -> None:
         """Route model-originated sleep requests to nap or sleep workflows."""
