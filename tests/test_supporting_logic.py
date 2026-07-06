@@ -318,6 +318,36 @@ class TestSecondVoiceProtocolHelpers:
         assert req == ""
         assert out == "alpha beta"
 
+    def test_second_voice_recent_context_uses_last_three_messages(self, daemon):
+        daemon._history = [
+            {"role": "system", "content": "ignore me"},
+            {"role": "human", "content": "first"},
+            {"role": "assistant", "content": "second"},
+            {"role": "human", "content": "third"},
+            {"role": "assistant", "content": "fourth"},
+        ]
+        out = daemon._second_voice_recent_context(limit_msgs=3, max_chars=1024)
+        assert "first" not in out
+        assert "second" in out
+        assert "third" in out
+        assert "fourth" in out
+
+    def test_second_voice_recent_context_truncates_to_budget(self, daemon):
+        daemon._history = [
+            {"role": "human", "content": "a" * 100},
+            {"role": "assistant", "content": "b" * 100},
+            {"role": "human", "content": "c" * 100},
+        ]
+        out = daemon._second_voice_recent_context(limit_msgs=3, max_chars=80)
+        assert len(out) <= 80
+        assert "truncated" in out
+
+    def test_second_voice_revision_prompt_mentions_human(self):
+        out = bd.BubbleDaemon._second_voice_revision_prompt("note text")
+        assert "facing the human" in out
+        assert "no longer in the internal dialogue" in out
+        assert "note text" in out
+
 
 # ---------------------------------------------------------------------------
 # Inline think tag drainage

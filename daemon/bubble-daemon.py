@@ -62,6 +62,7 @@ MEMORY_META_KEY = "_memory_meta"
 DEFAULT_EMBED_MODEL = "embed-gemma:300m"
 DEFAULT_EMBED_TIMEOUT = 3.0
 DEFAULT_EMBED_MAX_TEXT_CHARS = 1600
+DEFAULT_SECOND_VOICE_CONTEXT_CHARS = 1024
 DEFAULT_SECOND_VOICE_PROMPT = (
     "You are Bubble's Second Voice: an internal reflective partner. "
     "There is no human in this channel. Help the primary model test assumptions, "
@@ -1569,7 +1570,11 @@ class BubbleDaemon:
         stripped = re.sub(r"<think>[\s\S]*?</think>", "", text, flags=re.IGNORECASE)
         return stripped.strip()
 
-    def _second_voice_recent_context(self, limit_msgs: int = 6) -> str:
+    def _second_voice_recent_context(
+        self,
+        limit_msgs: int = 3,
+        max_chars: int = DEFAULT_SECOND_VOICE_CONTEXT_CHARS,
+    ) -> str:
         with self._lock:
             recent = self._history[-limit_msgs:]
         lines: list[str] = []
@@ -1578,7 +1583,25 @@ class BubbleDaemon:
             content = str(msg.get("content", "")).strip()
             if content:
                 lines.append(f"{role}: {content}")
-        return "\n".join(lines)
+        joined = "\n".join(lines)
+        if len(joined) <= max_chars:
+            return joined
+        notice = "[recent context truncated]\n"
+        keep = max(0, max_chars - len(notice))
+        tail = joined[-keep:] if keep else ""
+        return notice + tail.lstrip()
+
+    @staticmethod
+    def _second_voice_revision_prompt(second_voice_text: str) -> str:
+        return (
+            "The Second Voice exchange is complete. You are no longer in the internal dialogue. "
+            "You are facing the human in the Bubble conversation again. "
+            "Use the Second Voice note below to revise your prior answer. "
+            "Preserve your style and commitments unless the note reveals a clear issue. "
+            "Return only the revised final answer text for the human.\n\n"
+            "Second Voice note:\n"
+            f"{second_voice_text.strip()}"
+        )
 
     def _consult_second_voice(
         self,
@@ -1593,15 +1616,15 @@ class BubbleDaemon:
         if not focus:
             focus = "Review the latest draft answer for framing, consistency, and blind spots."
 
-        recent = self._second_voice_recent_context()
+        recent = self._second_voice_recent_context(limit_msgs=3)
         user_payload = (
             "Primary model consult request:\n"
             f"{focus}\n\n"
-            "Latest user input:\n"
+            "Latest human input:\n"
             f"{user_text.strip()}\n\n"
             "Primary model draft answer:\n"
             f"{draft_text.strip()}\n\n"
-            "Recent conversation context:\n"
+            "Recent Bubble conversation context:\n"
             f"{recent}"
         )
 
@@ -1638,13 +1661,7 @@ class BubbleDaemon:
         if not second_voice_text.strip():
             return ""
 
-        revision_prompt = (
-            "Use the Second Voice note below to revise your prior answer. "
-            "Preserve your style and commitments unless the note reveals a clear issue. "
-            "Return only the revised final answer text.\n\n"
-            "Second Voice note:\n"
-            f"{second_voice_text.strip()}"
-        )
+        revision_prompt = self._second_voice_revision_prompt(second_voice_text)
         payload = {
             "model": self._auto_model(),
             "stream": False,
