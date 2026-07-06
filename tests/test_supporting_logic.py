@@ -262,6 +262,40 @@ class TestCosineSimilarity:
 
 
 # ---------------------------------------------------------------------------
+# Second Voice utilities
+# ---------------------------------------------------------------------------
+
+class TestSecondVoiceProtocolHelpers:
+    def test_extract_second_voice_with_focus(self):
+        text = "Start [[BUBBLE:second_voice:stress-test this framing]] done"
+        clean, req = bd.BubbleDaemon._extract_second_voice_request(text)
+        assert req == "stress-test this framing"
+        assert "second_voice" not in clean
+
+    def test_extract_second_voice_without_focus(self):
+        text = "Start [[BUBBLE:second_voice]] done"
+        clean, req = bd.BubbleDaemon._extract_second_voice_request(text)
+        assert req == ""
+        assert "second_voice" not in clean
+
+    def test_extract_second_voice_absent(self):
+        text = "No marker"
+        clean, req = bd.BubbleDaemon._extract_second_voice_request(text)
+        assert clean == text
+        assert req is None
+
+    def test_strip_think_blocks(self):
+        text = "before <think>hidden chain of thought</think> after"
+        assert bd.BubbleDaemon._strip_think_blocks(text) == "before  after"
+
+    def test_build_system_content_mentions_second_voice(self, daemon, monkeypatch):
+        monkeypatch.setattr(daemon, "_second_voice_available", lambda: True)
+        out = daemon._build_system_content(context={}, telemetry=None, message="")
+        assert "Second Voice endpoint:" in out
+        assert "available" in out
+
+
+# ---------------------------------------------------------------------------
 # Inline think tag drainage
 # ---------------------------------------------------------------------------
 

@@ -325,6 +325,22 @@ class TestSleepIntent:
         assert intent is None
 
 
+class TestSecondVoiceIntent:
+    def test_second_voice_marker_with_focus(self, daemon):
+        text = "Thinking [[BUBBLE:second_voice:challenge this premise]] done"
+        clean, changed = daemon._parse_memory_commands(text)
+        clean2, req = daemon._extract_second_voice_request(clean)
+        assert req == "challenge this premise"
+        assert "second_voice" not in clean2
+
+    def test_second_voice_marker_without_focus(self, daemon):
+        text = "Thinking [[BUBBLE:second_voice]] done"
+        clean, changed = daemon._parse_memory_commands(text)
+        clean2, req = daemon._extract_second_voice_request(clean)
+        assert req == ""
+        assert "second_voice" not in clean2
+
+
 # ---------------------------------------------------------------------------
 # _parse_memory_commands — edge cases / messy output
 # ---------------------------------------------------------------------------

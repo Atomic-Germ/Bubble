@@ -62,6 +62,11 @@ MEMORY_META_KEY = "_memory_meta"
 DEFAULT_EMBED_MODEL = "embed-gemma:300m"
 DEFAULT_EMBED_TIMEOUT = 3.0
 DEFAULT_EMBED_MAX_TEXT_CHARS = 1600
+DEFAULT_SECOND_VOICE_PROMPT = (
+    "You are Bubble's Second Voice: an internal reflective partner. "
+    "There is no human in this channel. Help the primary model test assumptions, "
+    "surface blind spots, and suggest tighter framing. Keep responses concise and actionable."
+)
 
 TAG_FIELDS = {"intent", "topic", "sentiment", "user", "user_identity"}
 
@@ -267,6 +272,25 @@ class BubbleDaemon:
         self._embed_enabled_runtime = False
         self._embed_cache: dict[str, list[float]] = {}
         self._embed_lock = threading.Lock()
+        self._second_voice_mode = os.environ.get("BUBBLE_SECOND_VOICE", "auto").strip().lower()
+        if self._second_voice_mode not in {"auto", "on", "off"}:
+            self._second_voice_mode = "auto"
+        self._second_voice_port = self._get_int_env("BUBBLE_SECOND_VOICE_PORT", 2020, 1, 65535)
+        self._second_voice_model = (
+            os.environ.get("BUBBLE_SECOND_VOICE_MODEL", "").strip() or "local"
+        )
+        self._second_voice_prompt = (
+            os.environ.get("BUBBLE_SECOND_VOICE_PROMPT", "").strip()
+            or DEFAULT_SECOND_VOICE_PROMPT
+        )
+        self._second_voice_timeout = self._get_float_env(
+            "BUBBLE_SECOND_VOICE_TIMEOUT",
+            25.0,
+            1.0,
+            120.0,
+        )
+        self._second_voice_check_mono = 0.0
+        self._second_voice_available_cached = False
         # Monotonic timestamp of the last event that changed _memory (remember,
         # forget, dream, summarize).  Used in telemetry reporting.
         self._last_memory_change_time: float = 0.0
@@ -311,11 +335,13 @@ class BubbleDaemon:
         # Subscribe to system sleep signal so we can dream before suspend.
         self._subscribe_sleep_signal()
         log.info(
-            "Bubble daemon ready  port=%d  model=%s  embeddings=%s(%s)  time_poll=%ss",
+            "Bubble daemon ready  port=%d  model=%s  embeddings=%s(%s)  second_voice=%s:%d  time_poll=%ss",
             self._port,
             self._model or "(auto-detect)",
             self._embed_mode,
             self._embed_model,
+            self._second_voice_mode,
+            self._second_voice_port,
             self._time_poll_seconds,
         )
         if self._system_prompt:
@@ -748,6 +774,10 @@ class BubbleDaemon:
     _RE_NOTE   = re.compile(r'(?<!\[)\[\[BUBBLE:note:([^\]]+)\]\](?!\])')
     _RE_UNNOTE = re.compile(r'(?<!\[)\[\[BUBBLE:unnote:([^\]]+)\]\](?!\])')
     _RE_SLEEP  = re.compile(r'(?<!\[)\[\[BUBBLE:sleep(?::(nap|sleep))?\]\](?!\])', re.IGNORECASE)
+    _RE_SECOND_VOICE = re.compile(
+        r'(?<!\[)\[\[BUBBLE:second_voice(?::([\s\S]*?))?\]\](?!\])',
+        re.IGNORECASE,
+    )
     _RE_PRIOR_BLOCK = re.compile(
         r'\[\[BUBBLE:prior_context\]\]([\s\S]*?)\[\[/BUBBLE:prior_context\]\]',
         re.IGNORECASE,
@@ -966,6 +996,31 @@ class BubbleDaemon:
             return clean.strip(), mode
 
         return text, None
+
+    @classmethod
+    def _extract_second_voice_request(cls, text: str) -> tuple[str, str | None]:
+        """Strip second-voice marker and return requested focus text.
+
+        Returns (clean_text, request) where request is:
+          - None if no marker was present
+          - "" for [[BUBBLE:second_voice]]
+          - non-empty focus text for [[BUBBLE:second_voice:...]]
+        """
+        seen = False
+        request = ""
+
+        def on_second_voice(m: re.Match) -> str:
+            nonlocal seen, request
+            seen = True
+            arg = (m.group(1) or "").strip()
+            if arg:
+                request = arg
+            return ""
+
+        clean = cls._RE_SECOND_VOICE.sub(on_second_voice, text)
+        if not seen:
+            return text, None
+        return clean.strip(), request
 
     @staticmethod
     def _in_sleep_window() -> bool:
@@ -1406,6 +1461,13 @@ class BubbleDaemon:
                 )
             parts.append("\n".join(lines))
 
+        second_voice_active = self._second_voice_available()
+        second_voice_state = "available" if second_voice_active else "unavailable"
+        second_voice_hint = (
+            f"Second Voice endpoint: 127.0.0.1:{self._second_voice_port} ({second_voice_state}, mode={self._second_voice_mode})."
+        )
+        parts.append("--- Second Voice ---\n" + second_voice_hint)
+
         parts.append(
             "--- Memory protocol ---\n"
             "To persist a fact, tag it with who originated it:\n"
@@ -1422,6 +1484,11 @@ class BubbleDaemon:
             "Use working notes when you want to hold a thread of thought across clock-tick intervals "
             "without committing it to permanent memory. Notes survive daemon restarts but are "
             "otherwise yours to manage and discard freely.\n"
+            "Second Voice protocol (internal model-to-model consult):\n"
+            "  Request consult with chosen focus: [[BUBBLE:second_voice:focus or question]]\n"
+            "  Request consult with auto context: [[BUBBLE:second_voice]]\n"
+            "When available, the daemon will consult the second model and return only its final output "
+            "(thinking tokens are stripped) to your revision pass.\n"
             "To request a rest/consolidation pass: [[BUBBLE:sleep]] "
             "(routes to a nap outside sleep window, sleep pass inside sleep window).\n"
             "Self revision protocol (fluid, but not abrupt):\n"
@@ -1433,6 +1500,152 @@ class BubbleDaemon:
             "The commit step is required before _self_prompt actually changes."
         )
         return "\n\n".join(parts)
+
+    def _second_voice_available(self) -> bool:
+        if self._second_voice_mode == "off":
+            return False
+        if self._second_voice_mode == "on":
+            return True
+
+        now = time.monotonic()
+        if now - self._second_voice_check_mono < 15.0:
+            return self._second_voice_available_cached
+
+        ok = False
+        try:
+            r = requests.get(
+                f"http://127.0.0.1:{self._second_voice_port}/v1/models",
+                timeout=1.2,
+            )
+            ok = r.ok
+        except Exception:
+            ok = False
+
+        self._second_voice_available_cached = ok
+        self._second_voice_check_mono = now
+        return ok
+
+    def _parse_completion_text(self, payload: dict) -> str:
+        choices = payload.get("choices", [])
+        if not choices:
+            return ""
+        msg = choices[0].get("message", {})
+        content = msg.get("content", "")
+
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    parts.append(str(item.get("text", "")))
+            return "".join(parts)
+        return str(content)
+
+    @classmethod
+    def _strip_think_blocks(cls, text: str) -> str:
+        stripped = re.sub(r"<think>[\s\S]*?</think>", "", text, flags=re.IGNORECASE)
+        return stripped.strip()
+
+    def _second_voice_recent_context(self, limit_msgs: int = 6) -> str:
+        with self._lock:
+            recent = self._history[-limit_msgs:]
+        lines: list[str] = []
+        for msg in recent:
+            role = str(msg.get("role", "")).strip() or "unknown"
+            content = str(msg.get("content", "")).strip()
+            if content:
+                lines.append(f"{role}: {content}")
+        return "\n".join(lines)
+
+    def _consult_second_voice(
+        self,
+        request: str,
+        user_text: str,
+        draft_text: str,
+    ) -> str:
+        if not self._second_voice_available():
+            return ""
+
+        focus = (request or "").strip()
+        if not focus:
+            focus = "Review the latest draft answer for framing, consistency, and blind spots."
+
+        recent = self._second_voice_recent_context()
+        user_payload = (
+            "Primary model consult request:\n"
+            f"{focus}\n\n"
+            "Latest user input:\n"
+            f"{user_text.strip()}\n\n"
+            "Primary model draft answer:\n"
+            f"{draft_text.strip()}\n\n"
+            "Recent conversation context:\n"
+            f"{recent}"
+        )
+
+        payload = {
+            "model": self._second_voice_model,
+            "stream": False,
+            "messages": [
+                {"role": "system", "content": self._second_voice_prompt},
+                {"role": "user", "content": user_payload},
+            ],
+        }
+        try:
+            r = requests.post(
+                f"http://127.0.0.1:{self._second_voice_port}/v1/chat/completions",
+                json=payload,
+                timeout=self._second_voice_timeout,
+            )
+            r.raise_for_status()
+            raw = self._parse_completion_text(r.json())
+            final = self._strip_think_blocks(raw)
+            if final:
+                log.info("Second Voice consult succeeded (%d chars)", len(final))
+            return final
+        except Exception as exc:
+            log.warning("Second Voice consult failed: %s", exc)
+            return ""
+
+    def _revise_with_second_voice(
+        self,
+        snapshot_messages: list,
+        draft_text: str,
+        second_voice_text: str,
+    ) -> str:
+        if not second_voice_text.strip():
+            return ""
+
+        revision_prompt = (
+            "Use the Second Voice note below to revise your prior answer. "
+            "Preserve your style and commitments unless the note reveals a clear issue. "
+            "Return only the revised final answer text.\n\n"
+            "Second Voice note:\n"
+            f"{second_voice_text.strip()}"
+        )
+        payload = {
+            "model": self._auto_model(),
+            "stream": False,
+            "messages": [
+                *snapshot_messages,
+                {"role": "assistant", "content": draft_text},
+                {"role": "user", "content": revision_prompt},
+            ],
+        }
+        try:
+            r = requests.post(
+                f"http://127.0.0.1:{self._port}/v1/chat/completions",
+                json=payload,
+                timeout=120,
+            )
+            r.raise_for_status()
+            revised = self._strip_think_blocks(self._parse_completion_text(r.json()))
+            if revised:
+                log.info("Second Voice revision pass succeeded (%d chars)", len(revised))
+            return revised
+        except Exception as exc:
+            log.warning("Second Voice revision pass failed: %s", exc)
+            return ""
 
     def ClearHistory(self) -> None:
         with self._lock:
@@ -1490,7 +1703,7 @@ class BubbleDaemon:
                 url, json=payload, stream=True, timeout=120
             ) as resp:
                 resp.raise_for_status()
-                self._consume_sse(resp, token, user_text, hardware_state)
+                self._consume_sse(resp, token, user_text, hardware_state, messages)
                 return  # _consume_sse handles commit + done/error signals
 
         except Exception as exc:
@@ -1503,6 +1716,7 @@ class BubbleDaemon:
         token: str,
         user_text: str,
         hardware_state: str,
+        snapshot_messages: list,
     ) -> None:
         # answer_text accumulates only `content` chunks (not reasoning_content).
         # This is what gets saved to history so future prompts stay clean.
@@ -1579,10 +1793,35 @@ class BubbleDaemon:
             if inline_reasoning:
                 GLib.idle_add(self.StreamThink, token, inline_reasoning)
 
-        # Parse any [[BUBBLE:...]] memory commands, then commit clean text.
+        # Parse any [[BUBBLE:...]] commands and optional second-voice consult marker.
         with self._lock:
             clean_text, mem_changed = self._parse_memory_commands(answer_text)
+            clean_text, second_voice_request = self._extract_second_voice_request(clean_text)
             clean_text, sleep_intent = self._extract_sleep_intent(clean_text)
+
+        second_voice_final = ""
+        if second_voice_request is not None:
+            second_voice_final = self._consult_second_voice(
+                second_voice_request,
+                user_text,
+                clean_text,
+            )
+            if second_voice_final:
+                revised = self._revise_with_second_voice(
+                    snapshot_messages,
+                    clean_text,
+                    second_voice_final,
+                )
+                if revised:
+                    with self._lock:
+                        clean_text, revised_mem_changed = self._parse_memory_commands(revised)
+                        clean_text, _ignored_second_request = self._extract_second_voice_request(clean_text)
+                        clean_text, revised_sleep_intent = self._extract_sleep_intent(clean_text)
+                        mem_changed = mem_changed or revised_mem_changed
+                        if sleep_intent is None:
+                            sleep_intent = revised_sleep_intent
+
+        with self._lock:
             self._history.append({"role": "assistant", "content": clean_text})
             self._trim_history()
             now = time.monotonic()
