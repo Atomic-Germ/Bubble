@@ -294,6 +294,30 @@ class TestSecondVoiceProtocolHelpers:
         assert "Second Voice endpoint:" in out
         assert "available" in out
 
+    def test_detect_second_voice_cutoff_no_marker(self):
+        out, req, cut = bd.BubbleDaemon._detect_second_voice_cutoff("hello ", "world")
+        assert out == "hello world"
+        assert req is None
+        assert cut is False
+
+    def test_detect_second_voice_cutoff_with_focus_marker(self):
+        out, req, cut = bd.BubbleDaemon._detect_second_voice_cutoff(
+            "prefix ",
+            "text [[BUBBLE:second_voice:review this]] trailing",
+        )
+        assert cut is True
+        assert req == "review this"
+        assert out == "prefix text"
+
+    def test_detect_second_voice_cutoff_with_plain_marker(self):
+        out, req, cut = bd.BubbleDaemon._detect_second_voice_cutoff(
+            "alpha ",
+            "beta [[BUBBLE:second_voice]] gamma",
+        )
+        assert cut is True
+        assert req == ""
+        assert out == "alpha beta"
+
 
 # ---------------------------------------------------------------------------
 # Inline think tag drainage

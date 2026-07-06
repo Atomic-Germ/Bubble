@@ -1022,6 +1022,28 @@ class BubbleDaemon:
             return text, None
         return clean.strip(), request
 
+    @classmethod
+    def _detect_second_voice_cutoff(
+        cls,
+        current_text: str,
+        incoming_visible: str,
+    ) -> tuple[str, str | None, bool]:
+        """Detect first complete second-voice marker in streamed visible text.
+
+        Returns (new_text, request, cut_now):
+          - If no complete marker exists yet: append text and return cut_now=False.
+          - If marker is complete: return text up to marker start, parsed request,
+            and cut_now=True so caller can stop the stream immediately.
+        """
+        candidate = current_text + incoming_visible
+        m = cls._RE_SECOND_VOICE.search(candidate)
+        if not m:
+            return candidate, None, False
+
+        request = (m.group(1) or "").strip()
+        prefix = candidate[:m.start()].rstrip()
+        return prefix, request, True
+
     @staticmethod
     def _in_sleep_window() -> bool:
         now_local = time.localtime()
@@ -1726,6 +1748,8 @@ class BubbleDaemon:
         answer_text = ""
         content_buffer = ""
         inline_think = False
+        second_voice_request: str | None = None
+        cut_to_second_voice = False
         try:
             for raw_line in resp.iter_lines():
                 if not raw_line:
@@ -1762,7 +1786,23 @@ class BubbleDaemon:
                         )
                     )
                     if visible:
-                        answer_text += visible
+                        next_text, req, cut_now = self._detect_second_voice_cutoff(
+                            answer_text,
+                            visible,
+                        )
+                        if cut_now:
+                            answer_text = next_text
+                            second_voice_request = req
+                            cut_to_second_voice = True
+                            GLib.idle_add(self.StreamEdit, token, answer_text)
+                            self._set_status("chatting", "consulting second voice")
+                            try:
+                                resp.close()
+                            except Exception:
+                                pass
+                            break
+
+                        answer_text = next_text
                         GLib.idle_add(self.StreamChunk, token, visible)
                     if inline_reasoning:
                         GLib.idle_add(self.StreamThink, token, inline_reasoning)
@@ -1779,7 +1819,7 @@ class BubbleDaemon:
                 token[:8], len(answer_text), exc,
             )
 
-        if content_buffer:
+        if content_buffer and not cut_to_second_voice:
             visible, inline_reasoning, content_buffer, inline_think = (
                 self._drain_inline_think_content(
                     content_buffer,
@@ -1788,25 +1828,42 @@ class BubbleDaemon:
                 )
             )
             if visible:
-                answer_text += visible
-                GLib.idle_add(self.StreamChunk, token, visible)
+                next_text, req, cut_now = self._detect_second_voice_cutoff(
+                    answer_text,
+                    visible,
+                )
+                if cut_now:
+                    answer_text = next_text
+                    second_voice_request = req
+                    cut_to_second_voice = True
+                    GLib.idle_add(self.StreamEdit, token, answer_text)
+                    self._set_status("chatting", "consulting second voice")
+                else:
+                    answer_text = next_text
+                    GLib.idle_add(self.StreamChunk, token, visible)
             if inline_reasoning:
                 GLib.idle_add(self.StreamThink, token, inline_reasoning)
 
         # Parse any [[BUBBLE:...]] commands and optional second-voice consult marker.
         with self._lock:
             clean_text, mem_changed = self._parse_memory_commands(answer_text)
-            clean_text, second_voice_request = self._extract_second_voice_request(clean_text)
+            if second_voice_request is None:
+                clean_text, second_voice_request = self._extract_second_voice_request(clean_text)
+            else:
+                # Cutoff path already consumed the first marker; still strip any extras.
+                clean_text, _extra_second_voice = self._extract_second_voice_request(clean_text)
             clean_text, sleep_intent = self._extract_sleep_intent(clean_text)
 
         second_voice_final = ""
         if second_voice_request is not None:
+            self._set_status("chatting", "consulting second voice")
             second_voice_final = self._consult_second_voice(
                 second_voice_request,
                 user_text,
                 clean_text,
             )
             if second_voice_final:
+                self._set_status("chatting", "integrating second voice")
                 revised = self._revise_with_second_voice(
                     snapshot_messages,
                     clean_text,

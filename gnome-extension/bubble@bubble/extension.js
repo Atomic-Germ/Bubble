@@ -800,6 +800,7 @@ export default class BubbleExtension extends Extension {
     _setStatus(state, detail = '') {
         this._statusState = state || 'hanging-out';
         if (!this._statusLabel) return;
+        const d = String(detail ?? '').toLowerCase();
 
         const map = {
             'hanging-out': 'Hanging out',
@@ -809,7 +810,15 @@ export default class BubbleExtension extends Extension {
             'idle': 'Hanging out',
         };
 
-        const label = map[this._statusState] ?? 'Hanging out';
+        let label = map[this._statusState] ?? 'Hanging out';
+        if (this._statusState === 'chatting') {
+            if (d.includes('consulting second voice'))
+                label = 'Second Voice';
+            else if (d.includes('integrating second voice'))
+                label = 'Synthesizing';
+            else if (d.includes('waiting for daemon'))
+                label = 'Connecting';
+        }
         this._statusLabel.set_text(label);
         this._statusLabel.remove_style_class_name('bubble-status-hanging-out');
         this._statusLabel.remove_style_class_name('bubble-status-chatting');
