@@ -62,6 +62,9 @@ MEMORY_META_KEY = "_memory_meta"
 DEFAULT_EMBED_MODEL = "embed-gemma:300m"
 DEFAULT_EMBED_TIMEOUT = 3.0
 DEFAULT_EMBED_MAX_TEXT_CHARS = 1600
+DEFAULT_SIDE_PORT = 52626  # Default sidecar port (after FastFlowLM)
+DEFAULT_SIDE_MODEL = "local"  # Default sidecar model
+
 DEFAULT_SECOND_VOICE_CONTEXT_CHARS = 1024
 DEFAULT_SECOND_VOICE_PROMPT = (
     "You are Bubble's Second Voice: an internal reflective partner. "
@@ -70,6 +73,27 @@ DEFAULT_SECOND_VOICE_PROMPT = (
 )
 
 TAG_FIELDS = {"intent", "topic", "sentiment", "user", "user_identity"}
+
+# Sidecar private memory (separate from Bubble's memory).
+SIDECAR_MEMORY_FILE = Path.home() / ".local" / "share" / "bubble" / "sidecar.json"
+# Sidecar summary stored in Bubble's memory (autonomous).
+SIDECAR_SUMMARY_KEY = "_sidecar_summary"
+
+# Sidecar conversation log for summarization.
+SIDECAR_LOG_FILE = _runtime_dir() / "bubble_sidecar.json"
+
+
+def _get_side_port() -> int:
+    env = os.environ.get("BUBBLE_SIDE_PORT", "")
+    if env.isdigit():
+        p = int(env)
+        if 1 <= p <= 65535:
+            return p
+    return DEFAULT_SIDE_PORT  # After FastFlowLM on 52625
+
+def _get_side_model() -> str:
+    env = os.environ.get("BUBBLE_SIDE_MODEL", "")
+    return env.strip() or DEFAULT_SIDE_MODEL
 
 # JSON file that persists named facts across sessions.
 MEMORY_FILE  = Path.home() / ".local" / "share" / "bubble" / "memory.json"
@@ -184,6 +208,23 @@ DBUS_XML = """<node>
       <arg type='s' name='pong' direction='out'/>
     </method>
 
+    <method name='SendSidecarMessage'>
+      <arg type='s' name='message' direction='in' />
+      <arg type='s' name='token' direction='in' />
+    </method>
+
+    <method name='SetSidecarSummary'>
+      <arg type='s' name='summary' direction='in' />
+    </method>
+
+    <method name='CheckSidecarAvailable'>
+      <arg type='b' name='available' direction='out' />
+    </method>
+
+    <method name='SummarizeForSidecar'>
+      <arg type='s' name='summary' direction='out' />
+    </method>
+
     <signal name='StreamChunk'>
       <arg type='s' name='token'/>
       <arg type='s' name='text'/>
@@ -238,6 +279,10 @@ class BubbleDaemon:
     StreamEdit  = signal()
     StreamError = signal()
     NudgeStart  = signal()
+    SidecarSummaryChanged = signal()
+    SidecarAvailable = signal()
+    SidecarError = signal()
+    SidecarDone = signal()
     StatusChanged = signal()
     SelfPromptProposalChanged = signal()
 
@@ -292,6 +337,14 @@ class BubbleDaemon:
         )
         self._second_voice_check_mono = 0.0
         self._second_voice_available_cached = False
+        # Sidecar state (autonomous private conversation)
+        self._sidecar_available = False
+        self._sidecar_port = _get_side_port()
+        self._sidecar_model = _get_side_model()
+        self._sidecar_serving = False
+        self._sidecar_thread = None
+        self._sidecar_url = None
+        self._sidecar_serving_id = 0
         # Monotonic timestamp of the last event that changed _memory (remember,
         # forget, dream, summarize).  Used in telemetry reporting.
         self._last_memory_change_time: float = 0.0
@@ -434,6 +487,78 @@ class BubbleDaemon:
     # ------------------------------------------------------------------
     def Ping(self) -> str:
         return "pong"
+
+    # ------------------------------------------------------------------
+    # Sidecar (autonomous private conversation)
+    # ------------------------------------------------------------------
+    def SendSidecarMessage(self, message: str, token: str) -> None:
+        """Send autonomous message to sidecar."""
+        if not hasattr(self, '_sidecar') or not self._sidecar or not self._sidecar.check_serving():
+            GLib.idle_add(self.SidecarError, token, "sidecar unavailable")
+            log.warning("Sidecar not available")
+            return
+        self._sidecar.send_to_sidecar(message, token)
+        log.info("Sidecar message sent (token=%s)", token[:8])
+
+    def SetSidecarSummary(self, summary: str) -> None:
+        """Autonomously inject sidecar summary into Bubble context."""
+        with self._lock:
+            if hasattr(self, '_sidecar') and self._sidecar:
+                self._sidecar.remember("_sidecar_summary", summary)
+            self._memory[SIDECAR_SUMMARY_KEY] = summary
+            self._emit_sidecar_summary()
+        log.info("Sidecar summary set (autonomous): %d chars", len(summary))
+
+    def _emit_sidecar_summary(self) -> None:
+        """Emit sidecar summary change signal."""
+        GLib.idle_add(self.SidecarSummaryChanged, self._memory.get(SIDECAR_SUMMARY_KEY, ""))
+
+    def CheckSidecarAvailable(self) -> None:
+        """Check sidecar availability and emit signal."""
+        available = self._check_sidecar_availability_unlocked()
+        GLib.idle_add(self.SidecarAvailable, available)
+
+    def _check_sidecar_availability_unlocked(self) -> bool:
+        """Check sidecar availability (caller holds lock)."""
+        if not hasattr(self, '_sidecar') or not self._sidecar:
+            return False
+        return self._sidecar.check_serving()
+
+    def SummarizeForSidecar(self) -> str:
+        """Summarize conversation for sidecar injection.
+        
+        This summary is:
+        1. Injected into Bubble's memory for D-Bus access
+        2. Injected into Sidecar's conversation log for Sidecar's summary
+        
+        IMPORTANT: Only includes conversation history, NOT Bubble's private memory.
+        Bubble's memory remains completely private and hidden from Sidecar.
+        """
+        with self._lock:
+            summary = self._build_sidecar_summary()
+            self._memory[SIDECAR_SUMMARY_KEY] = summary
+            # Inject into Sidecar's conversation log so Sidecar can summarize it
+            if hasattr(self, '_sidecar') and self._sidecar:
+                self._sidecar.inject_bubble_summary(summary)
+            self._emit_sidecar_summary()
+            return summary
+
+    def _build_sidecar_summary(self) -> str:
+        """Build conversation summary for Sidecar to read.
+        
+        IMPORTANT: Only includes conversation history, NOT Bubble's private memory.
+        Bubble's memory is completely private and hidden from Sidecar.
+        """
+        # Do NOT include memory - that is private to the resident AI and hidden from Sidecar
+        history = self._history[-20:] if self._history else []
+        history_text = "\n".join(f"{m['role'].upper()}: {m['content'][:150]}" for m in history)
+
+        summary = f"<bubble_conversation>\n"
+        summary += "Resident AI's conversation history (Bubble model instance).\n"
+        summary += "This conversation is private - Sidecar cannot access the resident AI's memory.\n"
+        if history_text:
+            summary += f"{history_text}\n"
+        return summary
 
     def _set_status(self, state: str, detail: str = "") -> None:
         """Emit a lightweight global status update for the extension UI."""

@@ -61,6 +61,19 @@ const DBUS_IFACE = `<node>
     <method name='Ping'>
       <arg type='s' name='pong' direction='out'/>
     </method>
+    <method name='SendSidecarMessage'>
+      <arg type='s' name='message' direction='in'/>
+      <arg type='s' name='token' direction='in'/>
+    </method>
+    <method name='SetSidecarSummary'>
+      <arg type='s' name='summary' direction='in'/>
+    </method>
+    <method name='CheckSidecarAvailable'>
+      <arg type='b' name='available' direction='out'/>
+    </method>
+    <method name='SummarizeForSidecar'>
+      <arg type='s' name='summary' direction='out'/>
+    </method>
     <signal name='StreamChunk'>
       <arg type='s' name='token'/>
       <arg type='s' name='text'/>
@@ -86,6 +99,18 @@ const DBUS_IFACE = `<node>
         <signal name='SelfPromptProposalChanged'>
             <arg type='b' name='has_pending'/>
             <arg type='b' name='approved'/>
+        </signal>
+        <signal name='SidecarSummaryChanged'>
+            <arg type='s' name='summary' direction='in'/>
+        </signal>
+        <signal name='SidecarAvailable'>
+            <arg type='b' name='available' direction='in'/>
+        </signal>
+        <signal name='SidecarError'>
+            <arg type='s' name='error' direction='in'/>
+        </signal>
+        <signal name='SidecarDone'>
+            <arg type='s' name='token' direction='in'/>
         </signal>
     <signal name='StreamError'>
       <arg type='s' name='token'/>
@@ -119,8 +144,13 @@ export default class BubbleExtension extends Extension {
         this._proposalRejectBtn = null;
         this._streamWatchdogId = 0;
         this._lastDaemonStartAttemptMs = 0;
+        this._sidecarLabel    = null;
+        this._sidecarWatchdogId = 0;
 
         this._buildUI();
+        this._connectDaemon();
+        this._registerKeybinding();
+        this._checkSidecar();
         this._connectDaemon();
         this._registerKeybinding();
     }
@@ -1043,5 +1073,13 @@ export default class BubbleExtension extends Extension {
                 return GLib.SOURCE_REMOVE;
             });
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Sidecar
+    // -----------------------------------------------------------------------
+    _checkSidecar() {
+        // Check if sidecar is available
+        this._proxy?.call('CheckSidecarAvailable', null, Gio.DBusCallFlags.NONE, 5000, null, null);
     }
 }
