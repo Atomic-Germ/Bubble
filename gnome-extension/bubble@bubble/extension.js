@@ -122,6 +122,29 @@ const DBUS_IFACE = `<node>
 // Interface info is not needed for proxy.call() + g-signal; pass null below.
 
 // ---------------------------------------------------------------------------
+// UI helpers
+// ---------------------------------------------------------------------------
+// St.BoxLayout historically took a boolean `vertical` property. Newer Shell
+// versions replaced it with `orientation` (Clutter.Orientation) and dropped
+// `vertical` entirely. Detect which API this runtime provides so the extension
+// keeps working across the supported Shell range.
+const _BOX_HAS_ORIENTATION = Object.prototype.hasOwnProperty.call(
+    St.BoxLayout.prototype, 'orientation'
+);
+
+function _boxLayout(props = {}) {
+    if (_BOX_HAS_ORIENTATION && props.vertical !== undefined) {
+        const boxProps = Object.assign({}, props);
+        delete boxProps.vertical;
+        boxProps.orientation = props.vertical
+            ? Clutter.Orientation.VERTICAL
+            : Clutter.Orientation.HORIZONTAL;
+        return new St.BoxLayout(boxProps);
+    }
+    return new St.BoxLayout(props);
+}
+
+// ---------------------------------------------------------------------------
 // Extension
 // ---------------------------------------------------------------------------
 export default class BubbleExtension extends Extension {
@@ -151,8 +174,6 @@ export default class BubbleExtension extends Extension {
         this._connectDaemon();
         this._registerKeybinding();
         this._checkSidecar();
-        this._connectDaemon();
-        this._registerKeybinding();
     }
 
     disable() {
@@ -494,7 +515,7 @@ export default class BubbleExtension extends Extension {
     // -----------------------------------------------------------------------
     _buildUI() {
         // ── Root container ────────────────────────────────────────────────
-        this._window = new St.BoxLayout({
+        this._window = _boxLayout({
             style_class: 'bubble-window',
             vertical:    true,
             width:       480,
@@ -506,7 +527,7 @@ export default class BubbleExtension extends Extension {
         });
 
         // ── Header ────────────────────────────────────────────────────────
-        const header = new St.BoxLayout({
+        const header = _boxLayout({
             style_class: 'bubble-header',
             vertical:    false,
         });
@@ -518,7 +539,7 @@ export default class BubbleExtension extends Extension {
             x_expand:    true,
         });
 
-        const statusPill = new St.BoxLayout({
+        const statusPill = _boxLayout({
             style_class: 'bubble-status',
             vertical:    false,
             x_align:     Clutter.ActorAlign.END,
@@ -538,7 +559,7 @@ export default class BubbleExtension extends Extension {
         statusPill.add_child(statusDot);
         statusPill.add_child(this._statusLabel);
 
-        const proposalPill = new St.BoxLayout({
+        const proposalPill = _boxLayout({
             style_class: 'bubble-proposal',
             vertical:    false,
             x_align:     Clutter.ActorAlign.END,
@@ -618,7 +639,7 @@ export default class BubbleExtension extends Extension {
             overlay_scrollbars:   true,
         });
 
-        this._msgBox = new St.BoxLayout({
+        this._msgBox = _boxLayout({
             style_class: 'bubble-msgs',
             vertical:    true,
             x_expand:    true,
@@ -626,7 +647,7 @@ export default class BubbleExtension extends Extension {
         this._scrollView.set_child(this._msgBox);
 
         // ── Input bar ─────────────────────────────────────────────────────
-        const inputRow = new St.BoxLayout({
+        const inputRow = _boxLayout({
             style_class: 'bubble-input-row',
             vertical:    false,
         });
@@ -902,7 +923,7 @@ export default class BubbleExtension extends Extension {
     _addMessage(role, text) {
         const isUser = role === 'user';
 
-        const row = new St.BoxLayout({
+        const row = _boxLayout({
             vertical: false,
             x_expand: true,
             x_align:  isUser
@@ -911,7 +932,7 @@ export default class BubbleExtension extends Extension {
         });
 
         if (isUser) {
-            const bubble = new St.BoxLayout({
+            const bubble = _boxLayout({
                 style_class: 'bubble-msg bubble-msg-user',
                 vertical:    true,
             });
@@ -930,7 +951,7 @@ export default class BubbleExtension extends Extension {
         }
 
         // ── Assistant bubble: vertical column with optional think section ──
-        const col = new St.BoxLayout({
+        const col = _boxLayout({
             style_class: 'bubble-msg bubble-msg-assistant',
             vertical:    true,
         });

@@ -50,6 +50,13 @@ def _get_port() -> int:
     return 52625  # FastFlowLM default
 
 
+def _runtime_dir() -> Path:
+    env = os.environ.get("XDG_RUNTIME_DIR", "").strip()
+    if env:
+        return Path(env)
+    return Path(f"/run/user/{os.getuid()}")
+
+
 # Keep at most this many user+assistant turns before trimming the oldest.
 MAX_HISTORY_TURNS = 50
 
@@ -105,12 +112,6 @@ SYSTEM_PROMPT_FILE = Path.home() / ".local" / "share" / "bubble" / "system_promp
 
 PENDING_SELF_PROMPT_KEY = "_self_prompt_proposal"
 PENDING_SELF_PROMPT_APPROVED_KEY = "_self_prompt_proposal_approved"
-
-def _runtime_dir() -> Path:
-    env = os.environ.get("XDG_RUNTIME_DIR", "").strip()
-    if env:
-        return Path(env)
-    return Path(f"/run/user/{os.getuid()}")
 
 # Live daily exchange log consumed by the slow-wave sleep cycle.
 DAILY_LOG_FILE = _runtime_dir() / "bubble_daily.json"
