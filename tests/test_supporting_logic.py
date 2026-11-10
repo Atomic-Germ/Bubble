@@ -704,34 +704,34 @@ class TestParseValueTags:
 # ---------------------------------------------------------------------------
 
 class TestGetPort:
-    """_get_port reads FLM_SERVE_PORT env var with validation."""
+    """_get_port reads OFLM_SERVE_PORT env var with validation."""
 
     def test_default(self, monkeypatch):
-        monkeypatch.delenv("FLM_SERVE_PORT", raising=False)
+        monkeypatch.delenv("OFLM_SERVE_PORT", raising=False)
         assert bd._get_port() == 52625
 
     def test_custom_valid(self, monkeypatch):
-        monkeypatch.setenv("FLM_SERVE_PORT", "11434")
+        monkeypatch.setenv("OFLM_SERVE_PORT", "11434")
         assert bd._get_port() == 11434
 
     def test_custom_invalid_too_low(self, monkeypatch):
-        monkeypatch.setenv("FLM_SERVE_PORT", "0")
+        monkeypatch.setenv("OFLM_SERVE_PORT", "0")
         assert bd._get_port() == 52625
 
     def test_custom_invalid_too_high(self, monkeypatch):
-        monkeypatch.setenv("FLM_SERVE_PORT", "99999")
+        monkeypatch.setenv("OFLM_SERVE_PORT", "99999")
         assert bd._get_port() == 52625
 
     def test_custom_invalid_not_number(self, monkeypatch):
-        monkeypatch.setenv("FLM_SERVE_PORT", "abc")
+        monkeypatch.setenv("OFLM_SERVE_PORT", "abc")
         assert bd._get_port() == 52625
 
     def test_edge_valid_min(self, monkeypatch):
-        monkeypatch.setenv("FLM_SERVE_PORT", "1")
+        monkeypatch.setenv("OFLM_SERVE_PORT", "1")
         assert bd._get_port() == 1
 
     def test_edge_valid_max(self, monkeypatch):
-        monkeypatch.setenv("FLM_SERVE_PORT", "65535")
+        monkeypatch.setenv("OFLM_SERVE_PORT", "65535")
         assert bd._get_port() == 65535
 
 

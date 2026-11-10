@@ -42,7 +42,7 @@ log = logging.getLogger("bubble")
 # Configuration
 # ---------------------------------------------------------------------------
 def _get_port() -> int:
-    env = os.environ.get("FLM_SERVE_PORT", "")
+    env = os.environ.get("OFLM_SERVE_PORT", "")
     if env.isdigit():
         p = int(env)
         if 1 <= p <= 65535:
@@ -1903,8 +1903,12 @@ class BubbleDaemon:
         }
 
         try:
+            # No read timeout: a slow model (tiny or huge) may take a long time
+            # to emit its first token, and tokens may be spaced far apart. Keep
+            # the stream alive as long as the server keeps the connection open;
+            # only the connect phase is bounded.
             with requests.post(
-                url, json=payload, stream=True, timeout=120
+                url, json=payload, stream=True, timeout=(10, None)
             ) as resp:
                 resp.raise_for_status()
                 self._consume_sse(resp, token, user_text, hardware_state, messages)

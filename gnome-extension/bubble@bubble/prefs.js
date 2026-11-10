@@ -94,7 +94,7 @@ export default class BubblePreferences extends ExtensionPreferences {
 
         const portRow = new Adw.ActionRow({
             title:    _('FastFlowLM port'),
-            subtitle: _('Default 52625 — override with $FLM_SERVE_PORT in the service environment.'),
+            subtitle: _('Default 52625 — override with $OFLM_SERVE_PORT in the service environment.'),
         });
         daemonGroup.add(portRow);
 

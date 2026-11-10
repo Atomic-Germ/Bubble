@@ -26,7 +26,7 @@ Bubble/
 |   +-- test_dbus_methods.py             # D-Bus method surface (memory, history, ping)
 |   +-- test_supporting_logic.py         # Helpers: cosine similarity, env parsing, elapsed fmt
 |
-+-- install.sh                           # One-shot install: daemon, systemd, extension, FLM
++-- install.sh                           # One-shot install: daemon, systemd, extension, OFLM
 +-- update.sh                            # Incremental update: daemon + extension only
 +-- .gitlab-ci.yml                       # CI: runs pytest
 +-- .gitignore                           # Ignores __pycache__

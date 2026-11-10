@@ -128,7 +128,7 @@ The model can propose identity revisions:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `FLM_SERVE_PORT` | `52625` | FastFlowLM server port |
+| `OFLM_SERVE_PORT` | `52625` | FastFlowLM server port |
 | `BUBBLE_MODEL` | auto-detect | Specific model name |
 | `BUBBLE_SYSTEM_PROMPT` | file | System prompt (env takes precedence over file) |
 | `BUBBLE_CTX` | `8192` | Estimated context window size (for dream trigger) |

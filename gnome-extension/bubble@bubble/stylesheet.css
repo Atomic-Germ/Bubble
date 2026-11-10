@@ -46,6 +46,10 @@
     color: rgba(165, 173, 199, 0.90);
 }
 
+.bubble-status-thinking {
+    color: rgba(125, 205, 235, 0.95);
+}
+
 .bubble-status-chatting {
     color: rgba(114, 225, 191, 0.95);
 }

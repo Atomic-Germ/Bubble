@@ -170,6 +170,9 @@ export default class BubbleExtension extends Extension {
         this._sidecarLabel    = null;
         this._sidecarWatchdogId = 0;
         this._historyRestored = false;
+        this._statusDot = null;
+        this._thinkingPulseId = 0;
+        this._thinkingPulseOn = false;
 
         this._buildUI();
         this._connectDaemon();
@@ -182,11 +185,13 @@ export default class BubbleExtension extends Extension {
         Main.wm.removeKeybinding('bubble-toggle');
 
         // UI
+        this._stopThinkingPulse();
         if (this._window) {
             Main.layoutManager.removeChrome(this._window);
             this._window.destroy();
             this._window = null;
         }
+        this._statusDot = null;
 
         // D-Bus
         for (const id of this._proxySigs)
@@ -390,6 +395,7 @@ export default class BubbleExtension extends Extension {
 
     _finishStreamWithError(displayText, statusDetail = 'idle') {
         this._clearStreamWatchdog();
+        this._stopThinkingPulse();
         if (this._streamLabel) {
             this._streamLabel.add_style_class_name('bubble-error');
             this._streamLabel.set_text(displayText);
@@ -404,6 +410,7 @@ export default class BubbleExtension extends Extension {
             return;
 
         this._clearStreamWatchdog();
+        this._stopThinkingPulse();
         // Format the completed answer with markdown → Pango
         // while we still hold a reference to the label.
         if (this._streamLabel) {
@@ -433,6 +440,7 @@ export default class BubbleExtension extends Extension {
         if (signalName === 'StreamChunk') {
             const text = unpacked[1];
             if (!this._isActiveStreamToken(token)) return;
+            this._noteFirstToken();
             this._bumpStreamWatchdog(token);
             const cur = this._streamLabel?.get_text() ?? '';
             this._streamLabel?.set_text(cur + text);
@@ -443,6 +451,7 @@ export default class BubbleExtension extends Extension {
         if (signalName === 'StreamThink') {
             const text = unpacked[1];
             if (!this._isActiveStreamToken(token)) return;
+            this._noteFirstToken();
             this._bumpStreamWatchdog(token);
             // Reveal the think section on the first token.
             if (this._thinkLabel && !this._thinkLabel.visible) {
@@ -473,7 +482,7 @@ export default class BubbleExtension extends Extension {
                 console.error(`[Bubble] NudgeStart UI error: ${e}`);
             }
             this._setInputEnabled(false);
-            this._startStreamWatchdog(token);
+            this._startThinkingPulse();
             return;
         }
 
@@ -554,6 +563,7 @@ export default class BubbleExtension extends Extension {
             style_class: 'bubble-status-dot',
             text:        '•',
         });
+        this._statusDot = statusDot;
 
         this._statusLabel = new St.Label({
             style_class: 'bubble-status-label',
@@ -773,7 +783,9 @@ export default class BubbleExtension extends Extension {
         // is already set when the first StreamChunk signal arrives.
         const token = GLib.uuid_string_random();
         this._currentToken = token;
-        this._startStreamWatchdog(token);
+        // No first-token deadline: show a pulsing "thinking" state until the
+        // model actually starts producing tokens.
+        this._startThinkingPulse();
 
         // Add UI bubbles — kept separate from the proxy call so a UI error
         // can never prevent the message from reaching the daemon.
@@ -903,6 +915,13 @@ export default class BubbleExtension extends Extension {
 
     _clearHistory() {
         this._proxy?.call('ClearHistory', null, Gio.DBusCallFlags.NONE, 2000, null, null);
+        // Clearing also abandons any in-flight stream from the UI's point of
+        // view, so a genuinely hung response can't leave the input disabled.
+        this._clearStreamWatchdog();
+        this._stopThinkingPulse();
+        this._resetStreamingState();
+        this._setInputEnabled(true);
+        this._setStatus('hanging-out', 'idle');
         this._msgBox.get_children().forEach(c => c.destroy());
     }
 
@@ -913,6 +932,7 @@ export default class BubbleExtension extends Extension {
 
         const map = {
             'hanging-out': 'Hanging out',
+            'thinking': 'Thinking',
             'chatting': 'Chatting',
             'napping': 'Napping',
             'sleeping': 'Sleeping',
@@ -929,11 +949,50 @@ export default class BubbleExtension extends Extension {
                 label = 'Connecting';
         }
         this._statusLabel.set_text(label);
-        this._statusLabel.remove_style_class_name('bubble-status-hanging-out');
-        this._statusLabel.remove_style_class_name('bubble-status-chatting');
-        this._statusLabel.remove_style_class_name('bubble-status-napping');
-        this._statusLabel.remove_style_class_name('bubble-status-sleeping');
-        this._statusLabel.add_style_class_name(`bubble-status-${this._statusState}`);
+
+        // Keep the dot and label in sync with the current state.
+        const cls = `bubble-status-${this._statusState}`;
+        for (const w of [this._statusLabel, this._statusDot]) {
+            if (!w) continue;
+            w.remove_style_class_name('bubble-status-hanging-out');
+            w.remove_style_class_name('bubble-status-chatting');
+            w.remove_style_class_name('bubble-status-napping');
+            w.remove_style_class_name('bubble-status-sleeping');
+            w.remove_style_class_name('bubble-status-thinking');
+            w.add_style_class_name(cls);
+        }
+    }
+
+    _startThinkingPulse() {
+        if (this._thinkingPulseId) return;
+        this._setStatus('thinking');
+        this._thinkingPulseOn = false;
+        this._thinkingPulseId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 550, () => {
+            if (!this._statusDot) return GLib.SOURCE_REMOVE;
+            this._thinkingPulseOn = !this._thinkingPulseOn;
+            try {
+                this._statusDot.set_opacity(this._thinkingPulseOn ? 255 : 80);
+            } catch (_e) {}
+            return GLib.SOURCE_CONTINUE;
+        });
+    }
+
+    _stopThinkingPulse() {
+        if (this._thinkingPulseId) {
+            GLib.source_remove(this._thinkingPulseId);
+            this._thinkingPulseId = 0;
+        }
+        this._thinkingPulseOn = false;
+        if (this._statusDot) {
+            try { this._statusDot.set_opacity(255); } catch (_e) {}
+        }
+    }
+
+    _noteFirstToken() {
+        if (this._thinkingPulseId) {
+            this._stopThinkingPulse();
+            this._setStatus('chatting');
+        }
     }
 
     _setProposalState(hasPending, approved = false) {
@@ -947,9 +1006,12 @@ export default class BubbleExtension extends Extension {
 
     _startStreamWatchdog(token) {
         this._clearStreamWatchdog();
+        // Inactivity watchdog only: it starts once tokens are flowing and is
+        // reset on every token, so a slow-but-progressing model is never cut
+        // off. A genuinely hung stream is left for the user to abandon.
         this._streamWatchdogId = GLib.timeout_add_seconds(
             GLib.PRIORITY_DEFAULT,
-            180,
+            300,
             () => {
                 if (!this._streaming || token !== this._currentToken)
                     return GLib.SOURCE_REMOVE;

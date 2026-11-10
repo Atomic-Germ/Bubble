@@ -38,7 +38,7 @@ See [PROJECT_MAP.md](PROJECT_MAP.md) for a full project layout and data flow dia
 - Python 3.10+
 - `pydbus` and `requests` Python packages
 - FastFlowLM server running on `127.0.0.1:52625`
-  (override with `$FLM_SERVE_PORT` environment variable)
+  (override with `$OFLM_SERVE_PORT` environment variable)
 
 ## Installation
 
@@ -83,7 +83,7 @@ systemctl --user restart bubble
 **Override the FastFlowLM port:**
 ```bash
 systemctl --user edit bubble
-# Add:  Environment=FLM_SERVE_PORT=11434
+# Add:  Environment=OFLM_SERVE_PORT=11434
 systemctl --user restart bubble
 ```
 
