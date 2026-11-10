@@ -226,6 +226,44 @@ class TestHistory:
         data = json.loads(raw)
         assert data[0]["content"] == "こんにちは"
 
+    def test_history_persists_to_disk(self, daemon, tmp_path):
+        daemon._history = [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"},
+        ]
+        daemon._save_history()
+
+        assert json.loads((tmp_path / "history.json").read_text()) == [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"},
+        ]
+        assert daemon._load_history() == daemon._history
+
+    def test_clear_history_persists_empty(self, daemon, tmp_path):
+        daemon._history = [{"role": "user", "content": "hello"}]
+        daemon._save_history()
+
+        daemon.ClearHistory()
+
+        assert (tmp_path / "history.json").read_text() == "[]"
+        assert daemon._load_history() == []
+
+    def test_load_history_filters_non_message_entries(self, daemon, tmp_path):
+        (tmp_path / "history.json").write_text(json.dumps([
+            {"role": "user", "content": "hi"},
+            {"role": "system", "content": "ignore"},
+            {"role": "assistant", "content": "hello"},
+        ]))
+
+        assert daemon._load_history() == [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+        ]
+
+    def test_load_history_corrupt_file(self, daemon, tmp_path):
+        (tmp_path / "history.json").write_text("not json")
+        assert daemon._load_history() == []
+
 
 # ---------------------------------------------------------------------------
 # Nudge config

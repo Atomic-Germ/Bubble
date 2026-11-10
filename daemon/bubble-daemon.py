@@ -109,6 +109,8 @@ MEMORY_BACKUP_DIR = Path.home() / ".local" / "share" / "bubble" / "memory-backup
 SCRATCH_FILE = Path.home() / ".local" / "share" / "bubble" / "scratch.json"
 # Persistent user-facing system prompt set over D-Bus.
 SYSTEM_PROMPT_FILE = Path.home() / ".local" / "share" / "bubble" / "system_prompt.txt"
+# JSON file that persists the rolling conversation history across restarts.
+HISTORY_FILE = Path.home() / ".local" / "share" / "bubble" / "history.json"
 
 PENDING_SELF_PROMPT_KEY = "_self_prompt_proposal"
 PENDING_SELF_PROMPT_APPROVED_KEY = "_self_prompt_proposal_approved"
@@ -289,7 +291,7 @@ class BubbleDaemon:
 
     # ------------------------------------------------------------------
     def __init__(self) -> None:
-        self._history: list[dict] = []
+        self._history: list[dict] = self._load_history()
         self._system_prompt: str  = os.environ.get("BUBBLE_SYSTEM_PROMPT", "")
         if not self._system_prompt:
             self._system_prompt = self._load_system_prompt()
@@ -1261,6 +1263,8 @@ class BubbleDaemon:
             snapshot.append({"role": "system", "content": system_content})
             snapshot.extend(self._history)
 
+        self._save_history()
+
         threading.Thread(
             target=self._stream_thread,
             args=(token, snapshot, message, hardware_state),
@@ -1812,9 +1816,44 @@ class BubbleDaemon:
             log.warning("Second Voice revision pass failed: %s", exc)
             return ""
 
+    def _load_history(self) -> list[dict]:
+        """Load persisted conversation history from disk; empty on first run."""
+        try:
+            if HISTORY_FILE.exists():
+                data = json.loads(HISTORY_FILE.read_text())
+                if isinstance(data, list):
+                    history = [
+                        {"role": str(m.get("role", "")), "content": str(m.get("content", ""))}
+                        for m in data
+                        if isinstance(m, dict) and m.get("role") in ("user", "assistant")
+                    ]
+                    log.info("History loaded: %d messages", len(history))
+                    return history
+        except Exception as exc:
+            log.warning("Could not load history file: %s", exc)
+        return []
+
+    def _save_history(self) -> None:
+        """Atomically persist the current conversation history to disk."""
+        with self._lock:
+            snapshot = list(self._history)
+        self._write_history_snapshot(snapshot)
+
+    @staticmethod
+    def _write_history_snapshot(snapshot: list[dict]) -> None:
+        """Atomically write a history snapshot to disk."""
+        try:
+            HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+            tmp = HISTORY_FILE.with_suffix(".tmp")
+            tmp.write_text(json.dumps(snapshot, indent=2))
+            tmp.replace(HISTORY_FILE)
+        except OSError as exc:
+            log.error("Failed to save history: %s", exc)
+
     def ClearHistory(self) -> None:
         with self._lock:
             self._history.clear()
+        self._save_history()
         log.info("History cleared")
 
     def GetHistory(self) -> str:
@@ -2028,6 +2067,7 @@ class BubbleDaemon:
             self._last_assistant_time = now
             self._record_exchange_event_unlocked(now)
 
+        self._save_history()
         self._set_status("chatting", "streaming response")
 
         if mem_changed:
@@ -2635,6 +2675,9 @@ class BubbleDaemon:
             self._nudging         = False
             self._last_nudge_time = time.monotonic()
 
+        if clean_text:
+            self._save_history()
+
         if mem_changed:
             self._save_memory()
 
@@ -2757,6 +2800,7 @@ class BubbleDaemon:
             self._summarizing = False
             self._last_memory_change_time = time.monotonic()
 
+        self._save_history()
         self._save_memory()
 
     # ------------------------------------------------------------------
@@ -2921,6 +2965,8 @@ class BubbleDaemon:
 
         if mem_changed or prior_changed:
             self._save_memory()
+            if prior_changed:
+                self._save_history()
             log.info("Dream pass complete (reason=%s) — memory/prior context updated", reason)
         else:
             log.info("Dream pass complete (reason=%s) — no changes", reason)
@@ -3021,6 +3067,8 @@ class BubbleDaemon:
 
         if mem_changed or prior_changed:
             self._save_memory()
+            if prior_changed:
+                self._save_history()
             log.info("Nap pass complete  reason=%s  updated=%s", reason, True)
         else:
             log.info("Nap pass complete  reason=%s  updated=%s", reason, False)

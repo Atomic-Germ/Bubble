@@ -169,6 +169,7 @@ export default class BubbleExtension extends Extension {
         this._lastDaemonStartAttemptMs = 0;
         this._sidecarLabel    = null;
         this._sidecarWatchdogId = 0;
+        this._historyRestored = false;
 
         this._buildUI();
         this._connectDaemon();
@@ -264,6 +265,9 @@ export default class BubbleExtension extends Extension {
                 this._pushSystemPrompt(false);
                 this._pushNudgeConfig();
                 this._refreshProposalState();
+                if (!this._historyRestored) {
+                    this._restoreHistory();
+                }
                 this._setStatus('hanging-out', 'idle');
                 this._settingsChanged = this.getSettings().connect(
                     'changed',
@@ -841,6 +845,60 @@ export default class BubbleExtension extends Extension {
         } catch (_e) {}
 
         return JSON.stringify(ctx);
+    }
+
+    _restoreHistory() {
+        if (!this._proxy) return;
+        this._proxy.call(
+            'GetHistory',
+            null,
+            Gio.DBusCallFlags.NONE,
+            2000,
+            null,
+            (proxy, result) => {
+                try {
+                    const res = proxy.call_finish(result);
+                    const [historyJson] = res.deepUnpack();
+                    const history = JSON.parse(historyJson);
+                    if (!Array.isArray(history)) {
+                        this._historyRestored = true;
+                        return;
+                    }
+                    // Mark restored before rendering so a render error can't
+                    // cause a duplicate restore on the next reconnect.
+                    this._historyRestored = true;
+                    for (const m of history) {
+                        if (!m || (m.role !== 'user' && m.role !== 'assistant'))
+                            continue;
+                        if (typeof m.content !== 'string' || !m.content.trim())
+                            continue;
+                        const label = this._addMessage(m.role, m.content);
+                        if (m.role === 'assistant') {
+                            try {
+                                label.clutter_text.set_markup(this._markdownToPango(m.content));
+                            } catch (_e) {
+                                // Invalid markup — plain text already displayed.
+                            }
+                        }
+                    }
+                    if (history.length) {
+                        console.log(`[Bubble] Restored ${history.length} messages from history`);
+                        this._scrollToBottom();
+                    }
+                } catch (e) {
+                    console.error(`[Bubble] GetHistory error: ${e}`);
+                    // The daemon was reachable but the call failed; retry once
+                    // shortly, and stop if the extension is disabled.
+                    if (!this._historyRestored && this._proxy) {
+                        GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 2, () => {
+                            if (!this._historyRestored && this._proxy)
+                                this._restoreHistory();
+                            return GLib.SOURCE_REMOVE;
+                        });
+                    }
+                }
+            },
+        );
     }
 
     _clearHistory() {

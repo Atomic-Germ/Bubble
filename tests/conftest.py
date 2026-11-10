@@ -26,6 +26,7 @@ def daemon(tmp_path, monkeypatch):
     monkeypatch.setattr(bd, "SCRATCH_FILE", tmp_path / "scratch.json")
     monkeypatch.setattr(bd, "SYSTEM_PROMPT_FILE", tmp_path / "system_prompt.txt")
     monkeypatch.setattr(bd, "DAILY_LOG_FILE", tmp_path / "bubble_daily.json")
+    monkeypatch.setattr(bd, "HISTORY_FILE", tmp_path / "history.json")
     # Prevent GLib.idle_add calls from blowing up in tests (no GLib main loop).
     monkeypatch.setattr(bd.GLib, "idle_add", lambda *a, **k: None)
 
