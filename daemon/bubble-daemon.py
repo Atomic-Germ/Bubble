@@ -79,6 +79,20 @@ DEFAULT_SECOND_VOICE_PROMPT = (
     "surface blind spots, and suggest tighter framing. Keep responses concise and actionable."
 )
 
+# Dream-space consolidation: curate the full context, decide what matters,
+# then summarize. The compacted context is injected back into the bubble and
+# embedded in the embedding space; a timestamped dream log keeps the history.
+DREAM_SUMMARY_TARGET_TOKENS = 4096
+DREAM_SUMMARY_MAX_CHARS = 40000          # generous cap (~10k tokens), not a target
+DREAM_HISTORY_KEEP = 6                   # recent raw messages kept after a dream
+DREAM_LOG_FILE = Path.home() / ".local" / "share" / "bubble" / "dream-log.json"
+DREAM_LOG_LIMIT = 50
+
+# Bounded retry for model calls — the backend may be re-loading or restarting.
+RETRY_ATTEMPTS = 4
+RETRY_BASE_DELAY = 5.0
+RETRY_MAX_DELAY = 30.0
+
 TAG_FIELDS = {"intent", "topic", "sentiment", "user", "user_identity"}
 
 # Sidecar private memory (separate from Bubble's memory).
@@ -303,6 +317,7 @@ class BubbleDaemon:
         self._summarizing = False  # prevents concurrent summarization runs
         self._dreaming    = False  # prevents concurrent dream runs
         self._napping     = False  # prevents concurrent nap runs
+        self._pending_witness_dropped = ""  # one-shot dream-drop injection
         self._ctx_size    = _get_ctx_size()
         self._daemon_start_mono = time.monotonic()
         self._daemon_start_wall = time.time()
@@ -911,6 +926,15 @@ class BubbleDaemon:
         r'\[\[BUBBLE:prior_context\]\]([\s\S]*?)\[\[/BUBBLE:prior_context\]\]',
         re.IGNORECASE,
     )
+    # Dream-space output blocks: the compacted context and the dropped summary.
+    _RE_DREAM_CONTEXT = re.compile(
+        r'\[\[BUBBLE:dream_context\]\]([\s\S]*?)\[\[/BUBBLE:dream_context\]\]',
+        re.IGNORECASE,
+    )
+    _RE_DREAM_DROPPED = re.compile(
+        r'\[\[BUBBLE:dream_dropped\]\]([\s\S]*?)\[\[/BUBBLE:dream_dropped\]\]',
+        re.IGNORECASE,
+    )
     # Placeholder patterns that mark an argument as a syntax example rather
     # than a real command.  Checked against the stripped argument string.
     _RE_PLACEHOLDER = re.compile(
@@ -1216,8 +1240,12 @@ class BubbleDaemon:
         return summary, cleaned
 
     @staticmethod
-    def _sanitize_prior_context_text(raw: str) -> str:
-        """Remove template/noise lines before storing synthesized prior context."""
+    def _sanitize_prior_context_text(raw: str, max_chars: int = 4000) -> str:
+        """Remove template/noise lines before storing synthesized prior context.
+
+        max_chars caps the stored summary; pass 0/None for no cap. The dream
+        space uses a much larger cap than the legacy prior-context block.
+        """
         lines: list[str] = []
         for line in raw.splitlines():
             s = line.strip()
@@ -1233,9 +1261,35 @@ class BubbleDaemon:
             lines.append(s)
 
         summary = "\n".join(lines).strip()
-        if len(summary) > 4000:
-            summary = summary[:4000].rstrip()
+        if max_chars and len(summary) > max_chars:
+            summary = summary[:max_chars].rstrip()
         return summary
+
+    @classmethod
+    def _extract_dream_blocks(cls, text: str) -> tuple[str, str, str]:
+        """Extract the dream-space compacted context and dropped summary.
+
+        Returns (compacted_context, dropped_summary, remaining_text). Missing
+        blocks come back as empty strings; the remaining text still has any
+        memory commands for the protocol parser.
+        """
+        m_ctx = cls._RE_DREAM_CONTEXT.search(text)
+        m_drop = cls._RE_DREAM_DROPPED.search(text)
+
+        context = ""
+        dropped = ""
+        if m_ctx:
+            context = cls._sanitize_prior_context_text(
+                m_ctx.group(1), max_chars=DREAM_SUMMARY_MAX_CHARS,
+            )
+        if m_drop:
+            dropped = cls._sanitize_prior_context_text(
+                m_drop.group(1), max_chars=DREAM_SUMMARY_MAX_CHARS,
+            )
+
+        cleaned = cls._RE_DREAM_CONTEXT.sub("", text)
+        cleaned = cls._RE_DREAM_DROPPED.sub("", cleaned)
+        return context, dropped, cleaned.strip()
 
     def SendMessage(self, message: str, token: str, context_json: str) -> None:
         """Queue a user message for streaming; token is provided by the caller."""
@@ -1441,10 +1495,18 @@ class BubbleDaemon:
             "input": text,
         }
         try:
-            r = requests.post(url, json=payload, timeout=self._embed_timeout)
+            # Embeddings are auxiliary: retry, but with a short cooldown so a
+            # missing backend doesn't stall memory selection.
+            r = self._post_with_retry(
+                url, payload, timeout=self._embed_timeout,
+                attempts=2, base_delay=0.2,
+            )
             if not r.ok and self._embed_model == "embed-gemma:300m":
                 payload["model"] = "embed-gemma"
-                r = requests.post(url, json=payload, timeout=self._embed_timeout)
+                r = self._post_with_retry(
+                    url, payload, timeout=self._embed_timeout,
+                    attempts=2, base_delay=0.2,
+                )
             r.raise_for_status()
             data = r.json()
             arr = data.get("data") or []
@@ -1528,6 +1590,13 @@ class BubbleDaemon:
         # Summarized older turns (internal key, set by auto-summarization).
         prior = self._memory.get("_prior_context", "")
         if prior:
+            # If the occupant asked to witness the dream, show what was dropped
+            # immediately before the compacted context is injected.
+            if self._pending_witness_dropped:
+                parts.append(
+                    "--- Dropped during dream ---\n" + self._pending_witness_dropped
+                )
+                self._pending_witness_dropped = ""
             parts.append("--- Prior conversation summary ---\n" + prior)
 
         pending_self = self._memory.get(PENDING_SELF_PROMPT_KEY, "").strip()
@@ -1767,10 +1836,9 @@ class BubbleDaemon:
             ],
         }
         try:
-            r = requests.post(
+            r = self._post_with_retry(
                 f"http://127.0.0.1:{self._second_voice_port}/v1/chat/completions",
-                json=payload,
-                timeout=self._second_voice_timeout,
+                payload, timeout=self._second_voice_timeout,
             )
             r.raise_for_status()
             raw = self._parse_completion_text(r.json())
@@ -1802,10 +1870,9 @@ class BubbleDaemon:
             ],
         }
         try:
-            r = requests.post(
+            r = self._post_with_retry(
                 f"http://127.0.0.1:{self._port}/v1/chat/completions",
-                json=payload,
-                timeout=120,
+                payload, timeout=120,
             )
             r.raise_for_status()
             revised = self._strip_think_blocks(self._parse_completion_text(r.json()))
@@ -1850,6 +1917,31 @@ class BubbleDaemon:
         except OSError as exc:
             log.error("Failed to save history: %s", exc)
 
+    def _load_dream_log(self) -> list[dict]:
+        """Load the timestamped dream log from disk."""
+        try:
+            if DREAM_LOG_FILE.exists():
+                data = json.loads(DREAM_LOG_FILE.read_text())
+                if isinstance(data, list):
+                    return data
+        except Exception as exc:
+            log.warning("Could not load dream log: %s", exc)
+        return []
+
+    def _append_dream_log(self, entry: dict) -> None:
+        """Append an entry to the timestamped dream log, trimming old entries."""
+        try:
+            data = self._load_dream_log()
+            data.append(entry)
+            if len(data) > DREAM_LOG_LIMIT:
+                data = data[-DREAM_LOG_LIMIT:]
+            DREAM_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+            tmp = DREAM_LOG_FILE.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data, indent=2))
+            tmp.replace(DREAM_LOG_FILE)
+        except OSError as exc:
+            log.error("Failed to append dream log: %s", exc)
+
     def ClearHistory(self) -> None:
         with self._lock:
             self._history.clear()
@@ -1859,6 +1951,55 @@ class BubbleDaemon:
     def GetHistory(self) -> str:
         with self._lock:
             return json.dumps(self._history)
+
+    # ------------------------------------------------------------------
+    # Model-call retry helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _retry_delay(attempt: int, base_delay: float) -> float:
+        return min(RETRY_MAX_DELAY, base_delay * (2 ** attempt))
+
+    def _post_with_retry(self, url, payload, timeout,
+                         attempts: int = RETRY_ATTEMPTS,
+                         base_delay: float = RETRY_BASE_DELAY):
+        """POST JSON with bounded exponential-backoff retry on transient failures."""
+        for attempt in range(attempts):
+            try:
+                resp = requests.post(url, json=payload, timeout=timeout)
+                if resp.status_code >= 500:
+                    resp.close()
+                    raise requests.exceptions.HTTPError(f"HTTP {resp.status_code}")
+                return resp
+            except Exception as exc:
+                if attempt + 1 >= attempts:
+                    raise
+                delay = self._retry_delay(attempt, base_delay)
+                log.warning(
+                    "Model request to %s failed (%s); retrying in %.1fs (attempt %d/%d)",
+                    url, exc, delay, attempt + 1, attempts,
+                )
+                time.sleep(delay)
+
+    def _stream_post_with_retry(self, url, payload,
+                                attempts: int = RETRY_ATTEMPTS,
+                                base_delay: float = RETRY_BASE_DELAY):
+        """Open a streaming POST with bounded retry on connection failures."""
+        for attempt in range(attempts):
+            try:
+                resp = requests.post(
+                    url, json=payload, stream=True, timeout=(10, None),
+                )
+                resp.raise_for_status()
+                return resp
+            except Exception as exc:
+                if attempt + 1 >= attempts:
+                    raise
+                delay = self._retry_delay(attempt, base_delay)
+                log.warning(
+                    "Stream connection to %s failed (%s); retrying in %.1fs (attempt %d/%d)",
+                    url, exc, delay, attempt + 1, attempts,
+                )
+                time.sleep(delay)
 
     # ------------------------------------------------------------------
     # Streaming worker  (runs in a background thread)
@@ -1906,11 +2047,9 @@ class BubbleDaemon:
             # No read timeout: a slow model (tiny or huge) may take a long time
             # to emit its first token, and tokens may be spaced far apart. Keep
             # the stream alive as long as the server keeps the connection open;
-            # only the connect phase is bounded.
-            with requests.post(
-                url, json=payload, stream=True, timeout=(10, None)
-            ) as resp:
-                resp.raise_for_status()
+            # only the connect phase is bounded (with bounded retry so a
+            # re-loading backend doesn't kill the request).
+            with self._stream_post_with_retry(url, payload) as resp:
                 self._consume_sse(resp, token, user_text, hardware_state, messages)
                 return  # _consume_sse handles commit + done/error signals
 
@@ -2649,7 +2788,7 @@ class BubbleDaemon:
         }
         log.info("Clock-tick request  token=%s  msgs=%d", token[:8], len(snapshot))
         try:
-            resp = requests.post(url, json=payload, timeout=(10, 90))
+            resp = self._post_with_retry(url, payload, timeout=(10, 90))
             resp.raise_for_status()
             raw_text = (
                 resp.json()
@@ -2766,7 +2905,7 @@ class BubbleDaemon:
             "stream":   False,
         }
         try:
-            resp = requests.post(url, json=payload, timeout=120)
+            resp = self._post_with_retry(url, payload, timeout=120)
             resp.raise_for_status()
             summary = (
                 resp.json()
@@ -2872,72 +3011,67 @@ class BubbleDaemon:
         ).start()
 
     def _dream_thread(self, reason: str) -> None:
-        """Silent synthesis: ask the model to reflect on memory + history,
-        emit only [[BUBBLE:remember/forget]] commands.  Nothing is shown to
-        the user; the result is piped straight through _parse_memory_commands.
+        """Dream-space consolidation: curate the full context, decide what
+        matters, then summarize. The compacted context is injected back into
+        the bubble as prior context and embedded in the embedding space; the
+        occupant may optionally witness what was dropped. Runs on a background
+        thread and is hidden from the user except for the Sleeping status.
         """
         url   = f"http://127.0.0.1:{self._port}/v1/chat/completions"
         model = self._auto_model()
 
-        with self._lock:
-            user_mem = {
-                k: v for k, v in self._memory.items() if not k.startswith("_")
-            }
-            prior   = self._memory.get("_prior_context", "")
-            history = list(self._history[-20:])  # most recent 20 msgs
-
-        # Build a rich context block for the synthesis prompt.
-        mem_block = ""
-        if user_mem:
-            mem_block = "Current memory:\n" + "\n".join(
-                f"  {k}: {v}" for k, v in user_mem.items()
-            )
-        prior_block = f"Prior summary:\n{prior}" if prior else ""
-        history_block = ""
-        if history:
-            history_block = "Recent conversation:\n" + "\n".join(
-                f"  {m['role'].upper()}: {m['content'][:200]}"
-                for m in history
-            )
-
-        context_str = "\n\n".join(
-            b for b in [mem_block, prior_block, history_block] if b
-        )
-
-        if reason in ("sleep", "sleep-intent"):
-            task = (
-                "The system is about to sleep. "
-                "Reflect quietly on everything below. "
-            )
-        else:
-            task = (
-                "Your context is becoming full. "
-                "Reflect on everything below and consolidate. "
-            )
-
-        dream_prompt = (
-            f"{task}"
-            "Find patterns, resolve contradictions, and surface anything worth carrying forward. "
-            "Return output in this exact structure:\n"
-            "[[BUBBLE:prior_context]]\n"
-            "<compressed context summary, 6-12 lines, concrete and concise>\n"
-            "[[/BUBBLE:prior_context]]\n"
-            "Then zero or more memory commands like [[BUBBLE:remember:key=value]] "
-            "or [[BUBBLE:forget:key]].\n"
-            "No extra prose outside the block and command lines."
-            f"\n\n{context_str}"
-        )
-
-        payload = {
-            "model":      model,
-            "messages":   [{"role": "user", "content": dream_prompt}],
-            "stream":     False,
-            "max_tokens": 512,
-        }
-        log.info("Dream pass starting  reason=%s", reason)
+        log.info("Dream-space pass starting  reason=%s", reason)
         self._set_status("sleeping", "deep consolidation")
+
         try:
-            resp = requests.post(url, json=payload, timeout=(10, 120))
+            # 1. Offer the occupant the option to witness the consolidation.
+            witness = self._ask_witness_question(url, model, reason)
+
+            # 2. Gather the full context: all history, memory, prior summary,
+            #    and working notes.
+            with self._lock:
+                history = list(self._history)
+                user_mem = {
+                    k: v for k, v in self._memory.items() if not k.startswith("_")
+                }
+                prior = self._memory.get("_prior_context", "")
+                scratch = dict(self._scratch)
+
+            context_str = self._format_dream_context(history, user_mem, prior, scratch)
+
+            # 3. Ask the model to curate, then summarize. The token budget is a
+            #    target, not a hard limit; the output cap is generous.
+            if reason in ("sleep", "sleep-intent"):
+                task = "The system is about to sleep."
+            else:
+                task = "Your context is becoming full."
+
+            dream_prompt = (
+                f"{task} Decide what is and is not important in the context below, "
+                "then summarize the material worth carrying forward. "
+                f"Target around {DREAM_SUMMARY_TARGET_TOKENS} tokens for the compacted "
+                "context — this is a guideline, not a hard limit. "
+                "Return output in this exact structure:\n"
+                "[[BUBBLE:dream_context]]\n"
+                "<compacted context: the important material, concrete and concise>\n"
+                "[[/BUBBLE:dream_context]]\n"
+                "[[BUBBLE:dream_dropped]]\n"
+                "<a brief summary of what you decided to drop and why>\n"
+                "[[/BUBBLE:dream_dropped]]\n"
+                "Then zero or more memory commands like [[BUBBLE:remember:key=value]] "
+                "or [[BUBBLE:forget:key]].\n"
+                "No extra prose outside the blocks and command lines.\n\n"
+                f"{context_str}"
+            )
+
+            payload = {
+                "model":      model,
+                "messages":   [{"role": "user", "content": dream_prompt}],
+                "stream":     False,
+                "max_tokens": DREAM_SUMMARY_TARGET_TOKENS + 2048,
+            }
+
+            resp = self._post_with_retry(url, payload, timeout=(10, 300))
             resp.raise_for_status()
             raw = (
                 resp.json()
@@ -2945,36 +3079,120 @@ class BubbleDaemon:
                     .get("message", {})
                     .get("content", "")
             )
+
+            compacted, dropped, remainder = self._extract_dream_blocks(raw)
+            if not compacted:
+                log.warning("Dream-space pass returned no compacted context — skipping")
+                return
+
+            # 4. Inject the compacted context, keep a short recent tail of raw
+            #    history, and store the summary as a memory item so it is
+            #    embedded and recallable.
+            dream_key = f"dream_{time.strftime('%Y%m%d_%H%M%S')}"
+            with self._lock:
+                self._parse_memory_commands(remainder)
+                self._memory["_prior_context"] = compacted
+                self._memory[dream_key] = compacted
+                self._upsert_memory_meta_unlocked(
+                    dream_key, source="dream", tags={"topic": "dream"},
+                )
+                if len(self._history) > DREAM_HISTORY_KEEP:
+                    self._history = self._history[-DREAM_HISTORY_KEEP:]
+                if witness and dropped:
+                    self._pending_witness_dropped = dropped
+                self._last_memory_change_time = time.monotonic()
+
+            # 5. Embed the compacted context into the embedding space.
+            self._embed_text(compacted)
+
+            # 6. Record the dream in the timestamped log.
+            self._append_dream_log({
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime()),
+                "reason": reason,
+                "witness": witness,
+                "compacted_chars": len(compacted),
+                "dropped_chars": len(dropped),
+                "compacted_context": compacted,
+                "dropped_summary": dropped,
+            })
+
+            self._save_memory()
+            self._save_history()
+            log.info(
+                "Dream-space pass complete (reason=%s) — %d chars compacted, "
+                "%d dropped, witness=%s",
+                reason, len(compacted), len(dropped), witness,
+            )
         except Exception as exc:
-            log.error("Dream pass failed: %s", exc)
+            log.error("Dream-space pass failed: %s", exc)
+        finally:
             with self._lock:
                 self._dreaming = False
-            return
+            self._set_status("hanging-out", "idle")
 
-        prior_summary, remainder = self._extract_prior_context_block(raw)
-
-        # Run the output through the memory command parser.
-        # We hold the lock for the parse so memory writes are atomic.
-        with self._lock:
-            _, mem_changed = self._parse_memory_commands(remainder)
-            prior_changed = False
-            if prior_summary:
-                self._memory["_prior_context"] = prior_summary
-                # Keep only a tiny recent tail after dream consolidation.
-                if len(self._history) > 6:
-                    self._history = self._history[-6:]
-                prior_changed = True
-                self._last_memory_change_time = time.monotonic()
-            self._dreaming = False
-
-        if mem_changed or prior_changed:
-            self._save_memory()
-            if prior_changed:
-                self._save_history()
-            log.info("Dream pass complete (reason=%s) — memory/prior context updated", reason)
+    def _ask_witness_question(self, url: str, model: str, reason: str) -> bool:
+        """Ask the occupant whether it wants to witness the consolidation."""
+        if reason in ("sleep", "sleep-intent"):
+            question = (
+                "You've expressed a need to sleep; would you like to witness "
+                "the consolidation of your context? Respond with only 'yes' or 'no'."
+            )
         else:
-            log.info("Dream pass complete (reason=%s) — no changes", reason)
-        self._set_status("hanging-out", "idle")
+            question = (
+                "Your context is becoming full; would you like to witness "
+                "the consolidation? Respond with only 'yes' or 'no'."
+            )
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": question}],
+            "stream": False,
+            "max_tokens": 16,
+        }
+        try:
+            resp = self._post_with_retry(
+                url, payload, timeout=(10, 30), attempts=2, base_delay=1.0,
+            )
+            resp.raise_for_status()
+            raw = (
+                resp.json()
+                    .get("choices", [{}])[0]
+                    .get("message", {})
+                    .get("content", "")
+                    .strip()
+                    .lower()
+            )
+            return raw.startswith("yes") or raw.startswith("y")
+        except Exception as exc:
+            log.warning("Witness question failed: %s", exc)
+            return False
+
+    @staticmethod
+    def _format_dream_context(
+        history: list[dict],
+        user_mem: dict[str, str],
+        prior: str,
+        scratch: dict[str, str],
+    ) -> str:
+        """Format the full bubble context for the dream-space prompt."""
+        blocks: list[str] = []
+        if user_mem:
+            lines = ["Current memory:"]
+            for k, v in user_mem.items():
+                lines.append(f"  {k}: {v}")
+            blocks.append("\n".join(lines))
+        if prior:
+            blocks.append("Prior summary:\n" + prior)
+        if scratch:
+            lines = ["Working notes:"]
+            for k, v in scratch.items():
+                lines.append(f"  {k}: {v}")
+            blocks.append("\n".join(lines))
+        if history:
+            lines = ["Conversation:"]
+            for m in history:
+                lines.append(f"  {m['role'].upper()}: {m['content']}")
+            blocks.append("\n".join(lines))
+        return "\n\n".join(blocks)
 
     def _check_nap(self, reason: str = "model-intent") -> None:
         """Trigger a short nap pass outside the sleep window."""
@@ -3041,7 +3259,7 @@ class BubbleDaemon:
         log.info("Nap pass starting  reason=%s  ctx_pct=%d", reason, ctx_pct)
         self._set_status("napping", "context review")
         try:
-            resp = requests.post(url, json=payload, timeout=(10, 120))
+            resp = self._post_with_retry(url, payload, timeout=(10, 120))
             resp.raise_for_status()
             raw = (
                 resp.json()
